@@ -99,6 +99,10 @@ impl<S: Shell> Shell for Hot<S> {
         hot!(S::set_app_id, &mut self.0, window, app_id)
     }
 
+    fn window_sandbox(&mut self, window: WindowId, sandbox: &crate::Sandbox) {
+        hot!(S::window_sandbox, &mut self.0, window, sandbox)
+    }
+
     fn focus(&mut self, window: WindowId) {
         hot!(S::focus, &mut self.0, window)
     }
