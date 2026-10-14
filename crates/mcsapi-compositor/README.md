@@ -39,6 +39,13 @@ overview can draw what each window shows (`WindowPictures::uv` maps a window's
 frame onto it). It is the same for Wayland clients and in-process apps, and
 costs a screen-sized copy each frame, so it is off unless asked for.
 
+Window motion: a placement's `motion` draws the window somewhere else, or
+faded, for the frame (`Motion::shown`, `Motion::opacity`), so a shell can
+grow an opening window in or glide a retiled one to its new place. The
+decoration, an in-process app's pass and a client's surfaces are stretched
+from `frame` to `shown`, nothing is laid out again, and the client and input
+stay where `frame` and `client` say. A moving window gets no blur behind it.
+
 Accessibility: the host merges the chrome's egui tree, every in-process
 app's tree, a node per window and any `Shell::access_subtrees` (title-bar
 buttons, nodes an out-of-process program registered) into one AccessKit
