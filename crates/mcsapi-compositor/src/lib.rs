@@ -462,6 +462,23 @@ pub enum Command {
         /// Options (`grp:alt_shift_toggle`), or empty.
         options: String,
     },
+    /// Listen on a Unix socket at `socket` for the clients of one sandbox,
+    /// as if a sandbox engine had opened it with `wp_security_context_v1`:
+    /// every client that connects there is marked with `sandbox`, kept from
+    /// the privileged globals, and reported through
+    /// [`Shell::window_sandbox`]. For a sandbox the shell runs itself (a
+    /// virtual machine's windows, say), which has no Wayland connection to
+    /// ask for one with. Whatever is at `socket` already is replaced; the
+    /// directory should be one only the session's user can enter.
+    Sandbox {
+        /// Where to listen.
+        socket: std::path::PathBuf,
+        /// What to mark its clients with.
+        sandbox: Sandbox,
+    },
+    /// Stop listening at a socket [`Command::Sandbox`] opened, and remove
+    /// it. Clients already connected through it stay connected.
+    CloseSandbox(std::path::PathBuf),
 }
 
 /// A mouse button.
