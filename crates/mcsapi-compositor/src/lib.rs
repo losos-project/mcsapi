@@ -103,6 +103,23 @@ use smithay::reexports::calloop::channel;
 pub use hot::Hot;
 pub use runtime::{Edge, Reserved, Role, RuntimeClient};
 
+/// The sandbox a window's client connected through: the metadata a sandbox
+/// engine attached to the listening socket it opened with
+/// `wp_security_context_v1` (Flatpak does this for every app it starts).
+///
+/// The client did not write any of it and cannot change it, so a shell can
+/// show it as the truth about where a window came from: a window from a
+/// virtual machine, say, framed in that machine's colour.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Sandbox {
+    /// Which sandbox, as a reverse-DNS name: `org.flatpak`, `org.libvirt`.
+    pub engine: Option<String>,
+    /// What the sandbox calls what runs in it: an app's ID, a machine's name.
+    pub app_id: Option<String>,
+    /// Which instance of it, as the sandbox counts them.
+    pub instance_id: Option<String>,
+}
+
 /// Where a window is drawn this frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Placement {
@@ -588,6 +605,12 @@ pub trait Shell: 'static {
     /// only after the commit that maps the window, so
     /// [`Shell::map_window`] can see `app`.
     fn set_app_id(&mut self, _window: WindowId, _app_id: &str) {}
+
+    /// The window that was just mapped belongs to a client that connected
+    /// through a sandbox's socket. Called right after [`Shell::map_window`],
+    /// before the window is first placed, and only for such clients: a window
+    /// that never gets this call came from outside any sandbox.
+    fn window_sandbox(&mut self, _window: WindowId, _sandbox: &Sandbox) {}
 
     /// Focus a window (secondary clicks on window content).
     fn focus(&mut self, _window: WindowId) {}

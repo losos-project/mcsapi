@@ -3070,6 +3070,9 @@ impl<S: Shell> Host<S> {
             app_id.as_deref().unwrap_or("app"),
             title.as_deref().unwrap_or_default(),
         );
+        if let Some(sandbox) = sandbox_of(surface) {
+            self.shell.window_sandbox(id, &sandbox);
+        }
         self.windows.insert(id, Content::Wayland(window));
         self.window_mapped(id, &toplevel);
         self.sync();
@@ -3078,6 +3081,20 @@ impl<S: Shell> Host<S> {
         }
         self.run_commands();
     }
+}
+
+/// The sandbox `surface`'s client connected through, if it did.
+fn sandbox_of(surface: &WlSurface) -> Option<crate::Sandbox> {
+    let client = surface.client()?;
+    let context = client
+        .get_data::<ClientState>()?
+        .security_context
+        .as_ref()?;
+    Some(crate::Sandbox {
+        engine: context.sandbox_engine.clone(),
+        app_id: context.app_id.clone(),
+        instance_id: context.instance_id.clone(),
+    })
 }
 
 fn shell_key_route(shell: &mut impl Shell, key: &KeyInput, consumed_release: bool) -> KeyRoute {
