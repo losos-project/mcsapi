@@ -439,9 +439,19 @@ impl Library {
             .filter(|dir| dir.is_absolute())
             .or_else(|| var("HOME").map(|home| Path::new(&home).join(".local/share")));
         let system = var("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+        // `split_paths` panics on wasm32, where the toolkit also runs; the
+        // environment is empty there, so all it would split is the default.
+        #[cfg(target_family = "wasm")]
+        let system: Vec<PathBuf> = system
+            .to_string_lossy()
+            .split(':')
+            .map(PathBuf::from)
+            .collect();
+        #[cfg(not(target_family = "wasm"))]
+        let system = std::env::split_paths(&system);
         let dirs = home
             .into_iter()
-            .chain(std::env::split_paths(&system).filter(|dir| dir.is_absolute()))
+            .chain(system.into_iter().filter(|dir| dir.is_absolute()))
             .map(|dir| dir.join(app).join("themes"));
         Self::new(dirs)
     }

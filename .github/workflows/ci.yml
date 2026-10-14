@@ -78,6 +78,25 @@ jobs:
           ${{ matrix.features == 'gpui' && '--features mcsapi/gpui,mcsapi-components-gpui/gpui,mcsapi-gallery/gpui' || '' }}
           -- -D warnings
 
+  # The egui toolkit also runs in a browser (derisk's web demo builds the
+  # core apps for wasm32), so it has to keep building without Smithay.
+  wasm:
+    name: Toolkit on wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Clippy
+        run: >-
+          cargo clippy --locked --target wasm32-unknown-unknown
+          -p mcsapi-ui -p mcsapi-components -p mcsapi-runtime -p mcsapi-theme
+          -- -D warnings
+
   test:
     name: Test (${{ matrix.toolchain }}, ${{ matrix.features }})
     runs-on: ubuntu-latest
@@ -230,7 +249,7 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, test, docs, coverage, audit, nix]
+    needs: [fmt, clippy, wasm, test, docs, coverage, audit, nix]
     runs-on: ubuntu-latest
     steps:
       - name: Check required jobs
