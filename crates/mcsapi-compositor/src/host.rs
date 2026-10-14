@@ -135,7 +135,7 @@ use self::input::TabletInput;
 use crate::{
     Apps, Blur, Capture, ClientRequest, Command, Compositor, GestureEvent, Input, InstanceId, Job,
     KeyInput, KeyRoute, Modifiers, MouseButton, OutputTiming, Placement, Press, Reserved, Role,
-    RuntimeClient, Shell, a11y, accesskit, blur, egui, text_input::TextInputs,
+    RuntimeClient, Shell, WindowPictures, a11y, accesskit, blur, egui, text_input::TextInputs,
 };
 use mcsapi_ui::gesture::EguiBridge;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
@@ -382,6 +382,10 @@ pub(crate) struct Host<S: Shell> {
     blurrer: Option<blur::Blurrer>,
     /// Set once creating the blurrer failed, so it isn't retried every frame.
     blur_unavailable: bool,
+    /// Where the windows are copied for [`Shell::window_pictures`].
+    pictures: Option<Pictures>,
+    /// Whether the shell asked for them this frame.
+    wants_pictures: bool,
     vrr: bool,
     /// Refresh rate of the monitor showing the session window.
     refresh_mhz: u32,
@@ -722,6 +726,8 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         retired: Vec::new(),
         blurrer: None,
         blur_unavailable: false,
+        pictures: None,
+        wants_pictures: false,
         vrr,
         refresh_mhz,
         timing_checked: None,
@@ -2464,6 +2470,18 @@ impl<S: Shell> Host<S> {
         };
         let pointer = self.egui_pos();
         let accent = self.shell.theme().accent;
+        // The texture is filled by draw() below, after the windows and
+        // before the chrome, so the chrome built now shows this frame's.
+        self.wants_pictures = self.shell.wants_window_pictures();
+        let pictures = self
+            .pictures
+            .as_ref()
+            .filter(|_| self.wants_pictures)
+            .map(|p| WindowPictures {
+                texture: p.id,
+                size: screen.size(),
+            });
+        self.shell.window_pictures(pictures);
         let shell = &mut self.shell;
         let mut output = self.chrome.ctx.run_ui(input, |root| {
             shell.chrome(root, elapsed);
@@ -2821,6 +2839,14 @@ impl<S: Shell> Host<S> {
             );
             draw_surfaces(&mut frame, elements, scale)?;
         }
+        // The windows as they are now, before the chrome's blur and panels
+        // cover them.
+        let chrome_painter = self.chrome.painter.as_mut().expect("created above");
+        if self.wants_pictures {
+            copy_windows(&gl, chrome_painter, &mut self.pictures, screen_px)?;
+        } else if let Some(pictures) = self.pictures.take() {
+            chrome_painter.free_texture(pictures.id);
+        }
         blur_behind(
             &mut self.blurrer,
             &mut self.blur_unavailable,
@@ -3163,6 +3189,73 @@ fn blur_behind(
         }
         reset_gl(gl, screen_px);
     }
+}
+
+/// The texture behind [`WindowPictures`], registered with the chrome's
+/// painter (which deletes it with [`egui_glow::Painter::free_texture`]).
+struct Pictures {
+    texture: glow::Texture,
+    id: egui::TextureId,
+    /// In pixels; a resize makes a new texture under the same ID.
+    size: [u32; 2],
+}
+
+/// Copies the bound framebuffer into `pictures`, making the texture first
+/// when there is none of the screen's size.
+fn copy_windows(
+    gl: &glow::Context,
+    painter: &mut egui_glow::Painter,
+    pictures: &mut Option<Pictures>,
+    screen: [u32; 2],
+) -> std::result::Result<(), String> {
+    use glow::HasContext as _;
+    let [w, h] = [screen[0] as i32, screen[1] as i32];
+    // SAFETY: the frame's context is current with its framebuffer bound;
+    // the texture is made on that context.
+    unsafe {
+        if pictures.as_ref().is_none_or(|p| p.size != screen) {
+            let texture = gl.create_texture()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            for (param, value) in [
+                (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, param, value as i32);
+            }
+            // RGB, as the blur's: GLES can't copy a framebuffer without
+            // alpha into an RGBA texture, and windows are opaque anyway.
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGB as i32,
+                w,
+                h,
+                0,
+                glow::RGB,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let id = match pictures.take() {
+                Some(old) => {
+                    painter.replace_native_texture(old.id, texture);
+                    old.id
+                }
+                None => painter.register_native_texture(texture),
+            };
+            *pictures = Some(Pictures {
+                texture,
+                id,
+                size: screen,
+            });
+        }
+        let texture = pictures.as_ref().map(|p| p.texture);
+        gl.bind_texture(glow::TEXTURE_2D, texture);
+        gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+    Ok(())
 }
 
 fn reset_gl(gl: &glow::Context, screen: [u32; 2]) {

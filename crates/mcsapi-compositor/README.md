@@ -32,6 +32,13 @@ session window is on; `Shell::frame_interval` can slow them down, and
 with VRR, a whole number of refreshes without; declare VRR with
 `Compositor::vrr`, since a nested session cannot detect it).
 
+Live window pictures: while `Shell::wants_window_pictures` holds, the host
+copies the screen into a texture once every window is drawn and before the
+panels and chrome are, and hands it over with `Shell::window_pictures`, so an
+overview can draw what each window shows (`WindowPictures::uv` maps a window's
+frame onto it). It is the same for Wayland clients and in-process apps, and
+costs a screen-sized copy each frame, so it is off unless asked for.
+
 Accessibility: the host merges the chrome's egui tree, every in-process
 app's tree, a node per window and any `Shell::access_subtrees` (title-bar
 buttons, nodes an out-of-process program registered) into one AccessKit

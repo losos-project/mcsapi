@@ -484,6 +484,32 @@ pub struct Capture {
     pub rgba: Vec<u8>,
 }
 
+/// The screen with every window drawn and nothing over them (no panels, no
+/// chrome), for the chrome to show what windows hold: an overview's live
+/// thumbnails. See [`Shell::wants_window_pictures`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowPictures {
+    /// Drawable with the chrome's painter; this frame's windows are copied
+    /// into it before the chrome is drawn.
+    pub texture: egui::TextureId,
+    /// The screen's size, logical.
+    pub size: egui::Vec2,
+}
+
+impl WindowPictures {
+    /// The texture coordinates of `area` (logical, output-relative), for
+    /// [`egui::Painter::image`].
+    pub fn uv(&self, area: egui::Rect) -> egui::Rect {
+        let u = |x: f32| x / self.size.x;
+        // The copy keeps GL's rows, which run bottom to top.
+        let v = |y: f32| 1.0 - y / self.size.y;
+        egui::Rect::from_min_max(
+            egui::pos2(u(area.min.x), v(area.min.y)),
+            egui::pos2(u(area.max.x), v(area.max.y)),
+        )
+    }
+}
+
 /// A request a client made about its own window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -580,6 +606,19 @@ pub trait Shell: 'static {
 
     /// Paints one window's decoration, below its content.
     fn paint_decoration(&mut self, _painter: &egui::Painter, _placement: &Placement) {}
+
+    /// Whether the chrome is about to show what windows hold (an overview's
+    /// live thumbnails). Asked before each [`Shell::chrome`]. While it
+    /// holds, the host copies the screen into a texture once the windows
+    /// are drawn, a screen-sized copy each frame, so it is off by default.
+    fn wants_window_pictures(&self) -> bool {
+        false
+    }
+
+    /// Where the windows are copied, given before each [`Shell::chrome`]:
+    /// `Some` while [`Shell::wants_window_pictures`] holds (from the second
+    /// frame it does; the texture is made in the first), `None` otherwise.
+    fn window_pictures(&mut self, _pictures: Option<WindowPictures>) {}
 
     /// Shows the chrome above all windows. `elapsed_ms` counts from start.
     fn chrome(&mut self, _ui: &mut egui::Ui, _elapsed_ms: u32) {}

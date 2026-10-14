@@ -9,7 +9,7 @@ use mcsapi::WindowId;
 
 use crate::{
     Blur, Capture, ClientRequest, Command, KeyInput, KeyRoute, OutputTiming, Placement, Press,
-    Shell, TextField, Theme, WindowHint, WorkspaceInfo, a11y, accesskit, egui,
+    Shell, TextField, Theme, WindowHint, WindowPictures, WorkspaceInfo, a11y, accesskit, egui,
 };
 
 /// Calls a shell method through Subsecond's jump table when the `hotpatch`
@@ -151,6 +151,14 @@ impl<S: Shell> Shell for Hot<S> {
         hot!(S::paint_decoration, &mut self.0, painter, placement)
     }
 
+    fn wants_window_pictures(&self) -> bool {
+        hot!(S::wants_window_pictures, &self.0)
+    }
+
+    fn window_pictures(&mut self, pictures: Option<WindowPictures>) {
+        hot!(S::window_pictures, &mut self.0, pictures)
+    }
+
     fn chrome(&mut self, ui: &mut egui::Ui, elapsed_ms: u32) {
         hot!(S::chrome, &mut self.0, ui, elapsed_ms)
     }
@@ -256,6 +264,7 @@ mod tests {
     struct TestShell {
         blurs: Vec<Blur>,
         interval: Duration,
+        pictures: Option<WindowPictures>,
     }
 
     impl Shell for TestShell {
@@ -282,6 +291,14 @@ mod tests {
         fn frame_interval(&self, timing: &OutputTiming) -> Duration {
             self.interval.max(timing.refresh_interval())
         }
+
+        fn wants_window_pictures(&self) -> bool {
+            true
+        }
+
+        fn window_pictures(&mut self, pictures: Option<WindowPictures>) {
+            self.pictures = pictures;
+        }
     }
 
     #[test]
@@ -293,6 +310,7 @@ mod tests {
                 strength: 3,
             }],
             interval: Duration::from_millis(33),
+            pictures: None,
         });
         assert_eq!(shell.blur_regions(), shell.blurs);
         let timing = OutputTiming::default();
@@ -302,5 +320,21 @@ mod tests {
         shell.interval = Duration::ZERO;
         assert!(shell.blur_regions().is_empty());
         assert_eq!(shell.frame_interval(&timing), timing.refresh_interval());
+    }
+
+    #[test]
+    fn forwards_window_pictures() {
+        let mut shell = Hot(TestShell {
+            blurs: Vec::new(),
+            interval: Duration::ZERO,
+            pictures: None,
+        });
+        assert!(shell.wants_window_pictures());
+        let pictures = WindowPictures {
+            texture: egui::TextureId::User(3),
+            size: egui::vec2(1920.0, 1080.0),
+        };
+        shell.window_pictures(Some(pictures));
+        assert_eq!(shell.pictures, Some(pictures));
     }
 }

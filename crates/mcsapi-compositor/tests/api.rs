@@ -80,3 +80,19 @@ fn frames_follow_the_refresh_rate() {
     // Nonsense refresh rates fall back to something sane.
     assert!(hz(0, false).refresh_interval() <= Duration::from_secs(1));
 }
+
+#[test]
+fn window_pictures_map_screen_areas_onto_their_rows() {
+    use mcsapi_compositor::{WindowPictures, egui};
+    let pictures = WindowPictures {
+        texture: egui::TextureId::User(1),
+        size: egui::vec2(1000.0, 500.0),
+    };
+    // GL rows run bottom to top: the screen's top is v = 1.
+    let uv = pictures.uv(egui::Rect::from_min_max(
+        egui::pos2(100.0, 0.0),
+        egui::pos2(600.0, 250.0),
+    ));
+    assert_eq!(uv.min, egui::pos2(0.1, 1.0));
+    assert_eq!(uv.max, egui::pos2(0.6, 0.5));
+}
