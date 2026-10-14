@@ -13,8 +13,12 @@ mcsapi-theme.workspace = true
 gpui = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 miette.workspace = true
-smithay.workspace = true
 thiserror.workspace = true
+
+# The desktop policy's geometry comes from Smithay, which needs a Unix
+# kernel; a wasm32 build is the toolkit alone (see the crate docs).
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+smithay.workspace = true
 
 [features]
 gpui = ["dep:gpui", "dep:libc"]

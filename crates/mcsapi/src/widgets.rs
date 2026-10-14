@@ -3,8 +3,11 @@
 //! Inspired by React Bits' card emphasis, Aceternity's tabs, and shadcn/ui's
 //! compact controls, not their implementations. No decorative motion is used.
 
+#[cfg(not(target_family = "wasm"))]
 use crate::{Desktop, WorkspaceId};
-use egui::{Button, Color32, RichText, Stroke};
+use egui::Color32;
+#[cfg(not(target_family = "wasm"))]
+use egui::{Button, RichText, Stroke};
 
 /// Shared opaque colors for the egui and GPUI workspace bars.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +70,8 @@ impl Theme {
     }
 }
 
+// The workspace bars draw a Desktop, which a wasm32 build does not have.
+#[cfg(not(target_family = "wasm"))]
 fn label(id: WorkspaceId, active: bool) -> String {
     if active {
         format!("Workspace {id} · active")
@@ -80,6 +85,7 @@ fn label(id: WorkspaceId, active: bool) -> String {
 /// The host applies the returned ID with [`Desktop::switch_to`]. egui supplies
 /// button focus and keyboard activation; this is not an ARIA-style tab list.
 /// Calling this function does not mutate desktop state or allocate a collection.
+#[cfg(not(target_family = "wasm"))]
 pub fn egui_workspace_bar(
     ui: &mut egui::Ui,
     desktop: &Desktop,
@@ -123,7 +129,7 @@ pub fn egui_workspace_bar(
 /// The callback should update host state and request a redraw. GPUI controls
 /// are focusable and support Enter/Space activation. The host is responsible
 /// for application-level focus traversal and accessibility integration.
-#[cfg(feature = "gpui")]
+#[cfg(all(feature = "gpui", not(target_family = "wasm")))]
 pub fn gpui_workspace_bar(
     desktop: &Desktop,
     theme: Theme,

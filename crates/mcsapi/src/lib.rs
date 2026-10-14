@@ -15,25 +15,37 @@
 //! assert_eq!(placements.len(), 1);
 //! # Ok::<(), mcsapi::Error>(())
 //! ```
+//!
+//! On `wasm32` only the toolkit half is built ([`toolkit`], [`widgets`],
+//! [`theme`]): Smithay needs a Unix kernel, and a browser tab is never a
+//! compositor, so the desktop policy and its geometry are left out there.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[cfg(not(target_family = "wasm"))]
 mod desktop;
+#[cfg(not(target_family = "wasm"))]
 mod layout;
 pub mod toolkit;
 pub mod widgets;
 
+#[cfg(not(target_family = "wasm"))]
 pub use desktop::{Desktop, WindowId, Windows, Workspace, WorkspaceId};
+#[cfg(not(target_family = "wasm"))]
 pub use layout::{Layout, Placement, Placements};
 pub use mcsapi_theme as theme;
+#[cfg(not(target_family = "wasm"))]
 pub use smithay;
+#[cfg(not(target_family = "wasm"))]
 pub use smithay::utils::{Logical, Rectangle};
 
 /// A rectangle measured in logical compositor coordinates, not physical pixels.
+#[cfg(not(target_family = "wasm"))]
 pub type Geometry = Rectangle<i32, Logical>;
 
 /// An invalid desktop operation or layout input.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error, miette::Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
