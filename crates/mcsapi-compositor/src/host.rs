@@ -36,7 +36,7 @@ pub(crate) use timing::refresh;
 mod toplevel;
 mod workspaces;
 
-use mcsapi::WindowId;
+use mcsapi::{Geometry, WindowId};
 use smithay::{
     backend::{
         allocator::Fourcc,
@@ -134,8 +134,9 @@ use smithay::{
 use self::input::TabletInput;
 use crate::{
     Apps, Blur, Capture, ClientRequest, Command, Compositor, GestureEvent, Input, InstanceId, Job,
-    KeyInput, KeyRoute, Modifiers, MouseButton, OutputTiming, Placement, Press, Reserved, Role,
-    RuntimeClient, Shell, WindowPictures, a11y, accesskit, blur, egui, text_input::TextInputs,
+    KeyInput, KeyRoute, Modifiers, Motion, MouseButton, OutputTiming, Placement, Press, Reserved,
+    Role, RuntimeClient, Shell, WindowPictures, a11y, accesskit, blur, egui,
+    text_input::TextInputs,
 };
 use mcsapi_ui::gesture::EguiBridge;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
@@ -2753,7 +2754,7 @@ impl<S: Shell> Host<S> {
                             renderer,
                             loc.to_physical_precise_round(scale),
                             scale,
-                            1.0,
+                            p.motion.map_or(1.0, |m| f32::from(m.opacity) / 255.0),
                         );
                         (blurs, elements)
                     })
@@ -2822,22 +2823,33 @@ impl<S: Shell> Host<S> {
             .zip(contents)
             .zip(&surfaces)
         {
+            let motion = p.motion.map(|m| (p.frame, m));
             let deco = self.decorations.painter.as_mut().expect("created above");
+            if let Some((frame, m)) = motion {
+                move_pass(&mut decoration, frame, m);
+            }
             paint(&gl, deco, screen_px, &mut decoration);
             if let (Some(mut pass), Some(Content::Internal { egui, .. })) =
                 (content, self.windows.get_mut(&p.window))
             {
+                if let Some((frame, m)) = motion {
+                    move_pass(&mut pass, frame, m);
+                }
                 let painter = egui.painter.as_mut().expect("created above");
                 paint(&gl, painter, screen_px, &mut pass);
             }
-            blur_behind(
-                &mut self.blurrer,
-                &mut self.blur_unavailable,
-                &gl,
-                screen_px,
-                behind,
-            );
-            draw_surfaces(&mut frame, elements, scale)?;
+            // What a client blurs behind it is where it will be; while it
+            // moves there is nothing steady to blur.
+            if motion.is_none() {
+                blur_behind(
+                    &mut self.blurrer,
+                    &mut self.blur_unavailable,
+                    &gl,
+                    screen_px,
+                    behind,
+                );
+            }
+            draw_moved_surfaces(&mut frame, elements, scale, motion)?;
         }
         // The windows as they are now, before the chrome's blur and panels
         // cover them.
@@ -3083,8 +3095,25 @@ fn draw_surfaces(
     elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
     scale: Scale<f64>,
 ) -> Result {
+    draw_moved_surfaces(frame, elements, scale, None)
+}
+
+/// [`draw_surfaces`], stretched from the window's frame to where its
+/// [`Motion`] draws it. Their alpha was given when the elements were made.
+fn draw_moved_surfaces(
+    frame: &mut GlesFrame<'_, '_>,
+    elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+    scale: Scale<f64>,
+    motion: Option<(Geometry, Motion)>,
+) -> Result {
     for element in elements.iter().rev() {
-        let dst = element.geometry(scale);
+        let mut dst = element.geometry(scale);
+        if let Some((window, m)) = motion {
+            dst = moved_rect(window, m, dst);
+            if dst.is_empty() {
+                continue;
+            }
+        }
         element.draw(
             frame,
             element.src(),
@@ -3094,6 +3123,45 @@ fn draw_surfaces(
         )?;
     }
     Ok(())
+}
+
+/// Where `m` draws `r`, a rectangle within `window`'s frame, rounded
+/// outward to whole pixels so neighbouring surfaces leave no seam.
+fn moved_rect(
+    window: Geometry,
+    m: Motion,
+    r: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    let (x0, y0) = m.map(window, (r.loc.x as f32, r.loc.y as f32));
+    let (x1, y1) = m.map(
+        window,
+        ((r.loc.x + r.size.w) as f32, (r.loc.y + r.size.h) as f32),
+    );
+    let (x0, y0) = (x0.floor() as i32, y0.floor() as i32);
+    let (x1, y1) = (x1.ceil() as i32, y1.ceil() as i32);
+    Rectangle::new((x0, y0).into(), ((x1 - x0).max(0), (y1 - y0).max(0)).into())
+}
+
+/// Moves an egui pass drawn at `window`'s frame to where `m` draws it, and
+/// fades it by `m`'s opacity: every vertex and clip is mapped, so the
+/// shapes are stretched rather than laid out again.
+fn move_pass(pass: &mut Pass, window: Geometry, m: Motion) {
+    let map = |p: egui::Pos2| {
+        let (x, y) = m.map(window, (p.x, p.y));
+        egui::pos2(x, y)
+    };
+    let fade = f32::from(m.opacity) / 255.0;
+    for clipped in &mut pass.primitives {
+        clipped.clip_rect =
+            egui::Rect::from_min_max(map(clipped.clip_rect.min), map(clipped.clip_rect.max));
+        if let egui::epaint::Primitive::Mesh(mesh) = &mut clipped.primitive {
+            for v in &mut mesh.vertices {
+                v.pos = map(v.pos);
+                // Colours are premultiplied, so every channel fades.
+                v.color = v.color.gamma_multiply(fade);
+            }
+        }
+    }
 }
 
 /// Draws the pointer, which the frame paints last (the nested window hides
@@ -3671,6 +3739,51 @@ impl<S: Shell + 'static> PrimarySelectionHandler for Host<S> {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn a_moved_pass_is_stretched_and_faded() {
+        let window = Geometry::new((100, 100).into(), (400, 200).into());
+        let m = Motion {
+            shown: Geometry::new((200, 150).into(), (200, 100).into()),
+            opacity: 0,
+        };
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.colored_vertex(egui::pos2(500.0, 300.0), egui::Color32::WHITE);
+        let mut pass = Pass {
+            primitives: vec![egui::ClippedPrimitive {
+                clip_rect: egui::Rect::from_min_max(
+                    egui::pos2(100.0, 100.0),
+                    egui::pos2(500.0, 300.0),
+                ),
+                primitive: egui::epaint::Primitive::Mesh(mesh),
+            }],
+            textures: Default::default(),
+        };
+        move_pass(&mut pass, window, m);
+        let clipped = &pass.primitives[0];
+        assert_eq!(
+            clipped.clip_rect,
+            egui::Rect::from_min_max(egui::pos2(200.0, 150.0), egui::pos2(400.0, 250.0))
+        );
+        let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
+            unreachable!()
+        };
+        assert_eq!(mesh.vertices[0].pos, egui::pos2(400.0, 250.0));
+        assert_eq!(mesh.vertices[0].color, egui::Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn a_moved_surface_covers_whole_pixels() {
+        let window = Geometry::new((0, 0).into(), (300, 300).into());
+        let m = Motion {
+            shown: Geometry::new((10, 10).into(), (200, 200).into()),
+            opacity: 255,
+        };
+        let r = moved_rect(window, m, Rectangle::new((0, 30).into(), (300, 270).into()));
+        assert_eq!(r, Rectangle::new((10, 30).into(), (200, 180).into()));
+        let odd = moved_rect(window, m, Rectangle::new((1, 1).into(), (1, 1).into()));
+        assert_eq!(odd, Rectangle::new((10, 10).into(), (2, 2).into()));
+    }
 
     struct TestShell {
         keys: Vec<bool>,

@@ -119,6 +119,41 @@ pub struct Placement {
     pub tiled: Edges,
     /// Whether the window is maximized.
     pub maximized: bool,
+    /// Drawn somewhere else, or faded, while the shell animates it; `None`
+    /// draws it at `frame`.
+    pub motion: Option<Motion>,
+}
+
+/// How a shell is animating a window this frame. Only the drawing moves:
+/// the client stays configured to [`Placement::client`] and input follows
+/// [`Placement::frame`], so a motion should be short (an opening window
+/// growing in, a retiled one gliding to its new tile).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Motion {
+    /// Where the frame is drawn. The decoration and content are stretched
+    /// from [`Placement::frame`] to it.
+    pub shown: Geometry,
+    /// From 0 (not drawn) to 255 (opaque).
+    pub opacity: u8,
+}
+
+impl Motion {
+    /// Where a point of `frame` is drawn.
+    pub fn map(&self, frame: Geometry, (x, y): (f32, f32)) -> (f32, f32) {
+        let (sx, sy) = self.stretch(frame);
+        (
+            self.shown.loc.x as f32 + (x - frame.loc.x as f32) * sx,
+            self.shown.loc.y as f32 + (y - frame.loc.y as f32) * sy,
+        )
+    }
+
+    /// How much `frame` is stretched across, and down.
+    pub fn stretch(&self, frame: Geometry) -> (f32, f32) {
+        (
+            self.shown.size.w as f32 / frame.size.w.max(1) as f32,
+            self.shown.size.h as f32 / frame.size.h.max(1) as f32,
+        )
+    }
 }
 
 impl Placement {
@@ -131,6 +166,7 @@ impl Placement {
             focused,
             tiled: Edges::ALL,
             maximized: false,
+            motion: None,
         }
     }
 }

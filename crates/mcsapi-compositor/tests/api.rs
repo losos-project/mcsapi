@@ -96,3 +96,17 @@ fn window_pictures_map_screen_areas_onto_their_rows() {
     assert_eq!(uv.min, egui::pos2(0.1, 1.0));
     assert_eq!(uv.max, egui::pos2(0.6, 0.5));
 }
+
+#[test]
+fn a_motion_stretches_the_frame_onto_where_it_is_shown() {
+    use mcsapi::Geometry;
+    use mcsapi_compositor::Motion;
+    let frame = Geometry::new((100, 100).into(), (400, 200).into());
+    let m = Motion {
+        shown: Geometry::new((0, 50).into(), (200, 100).into()),
+        opacity: 128,
+    };
+    assert_eq!(m.stretch(frame), (0.5, 0.5));
+    assert_eq!(m.map(frame, (100.0, 100.0)), (0.0, 50.0));
+    assert_eq!(m.map(frame, (500.0, 300.0)), (200.0, 150.0));
+}
