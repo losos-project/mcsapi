@@ -287,6 +287,8 @@ enum Content {
         instance: InstanceId,
         egui: Egui,
         events: Vec<egui::Event>,
+        /// When its queued presses and releases happened (`ClickTiming`).
+        clicks: mcsapi_ui::ClickTiming,
         title: String,
         app_id: String,
         /// The app's accessibility tree from its last frame.
@@ -402,6 +404,8 @@ pub(crate) struct Host<S: Shell> {
     chrome: Egui,
     decorations: Egui,
     chrome_events: Vec<egui::Event>,
+    /// When the chrome's queued presses and releases happened.
+    chrome_clicks: mcsapi_ui::ClickTiming,
     /// The chrome's accessibility tree from its last frame.
     chrome_access: Option<accesskit::TreeUpdate>,
     merger: a11y::Merger,
@@ -740,6 +744,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         chrome: Egui::accessible(),
         decorations: Egui::new(),
         chrome_events: Vec::new(),
+        chrome_clicks: Default::default(),
         chrome_access: None,
         merger,
         #[cfg(feature = "atspi")]
@@ -946,6 +951,7 @@ impl<S: Shell> Host<S> {
                             instance,
                             egui: Egui::accessible(),
                             events: Vec::new(),
+                            clicks: Default::default(),
                             title,
                             app_id: app.as_str().to_owned(),
                             access: None,
@@ -2210,6 +2216,9 @@ impl<S: Shell> Host<S> {
                 }
             }
             Route::Chrome => {
+                if pointer_event.is_some() {
+                    self.chrome_clicks.button(pressed, time);
+                }
                 self.chrome_events.extend(pointer_event);
                 // The cancelled press's client lost focus, so this reaches
                 // no surface; it only keeps Smithay's pressed buttons in
@@ -2241,7 +2250,12 @@ impl<S: Shell> Host<S> {
                 } else {
                     self.content_under()
                 };
-                if let Some(events) = self.internal_events(under) {
+                if let Some(Content::Internal { events, clicks, .. }) =
+                    under.and_then(|w| self.windows.get_mut(&w))
+                {
+                    if pointer_event.is_some() {
+                        clicks.button(pressed, time);
+                    }
                     events.extend(pointer_event);
                 } else if let Some(pointer) = self.seat.get_pointer() {
                     pointer.button(
@@ -2485,6 +2499,7 @@ impl<S: Shell> Host<S> {
                 size: screen.size(),
             });
         self.shell.window_pictures(pictures);
+        self.chrome_clicks.frame(&self.chrome.ctx, time);
         let shell = &mut self.shell;
         let mut output = self.chrome.ctx.run_ui(input, |root| {
             shell.chrome(root, elapsed);
@@ -2608,6 +2623,7 @@ impl<S: Shell> Host<S> {
             instance,
             egui,
             events,
+            clicks,
             title,
             access,
             ..
@@ -2629,6 +2645,7 @@ impl<S: Shell> Host<S> {
             focused,
             ..Default::default()
         };
+        clicks.frame(&egui.ctx, time);
         let mut output = mcsapi_ui::run_frame(app, &egui.ctx, input, &theme);
         *access = output.platform_output.accesskit_update.take();
         for command in output.platform_output.commands {

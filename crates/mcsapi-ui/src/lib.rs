@@ -12,6 +12,8 @@
 //! that knows which section of the desktop's documentation explains it, for
 //! `mcsapi-components`' `ErrorAlert` to draw with a "Learn more" button.
 //!
+//! [`click`] keeps egui's clicks on the input's clock when frames are slow.
+//!
 //! [`dialog`] describes a dialog apart from its toolkit: the window it is
 //! modal to, as a portal names it, and the actions in its button row.
 //!
@@ -40,10 +42,12 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod click;
 pub mod dialog;
 pub mod error;
 pub mod gesture;
 
+pub use click::ClickTiming;
 pub use egui;
 pub use error::{Context, DocLink, Docs, Error, Result};
 pub use gesture::{GestureEvent, GestureTracker, Transform};
