@@ -458,7 +458,7 @@ struct ClientState {
     role: Option<Role>,
     /// The sandbox a client connected through, which keeps it from the
     /// privileged globals (see `security`).
-    security_context: Option<smithay::wayland::security_context::SecurityContext>,
+    sandbox: Option<crate::Sandbox>,
 }
 
 impl ClientData for ClientState {
@@ -892,6 +892,8 @@ impl<S: Shell> Host<S> {
                         variant,
                         options,
                     } => self.set_keymap(&layout, &variant, &options),
+                    Command::Sandbox { socket, sandbox } => self.security.listen(socket, sandbox),
+                    Command::CloseSandbox(socket) => self.security.close(&socket),
                     command @ (Command::Describe(_) | Command::Capture(_)) => {
                         // The shell may just have changed; show it drawn.
                         self.settle = self.settle.max(2);
@@ -3085,16 +3087,7 @@ impl<S: Shell> Host<S> {
 
 /// The sandbox `surface`'s client connected through, if it did.
 fn sandbox_of(surface: &WlSurface) -> Option<crate::Sandbox> {
-    let client = surface.client()?;
-    let context = client
-        .get_data::<ClientState>()?
-        .security_context
-        .as_ref()?;
-    Some(crate::Sandbox {
-        engine: context.sandbox_engine.clone(),
-        app_id: context.app_id.clone(),
-        instance_id: context.instance_id.clone(),
-    })
+    surface.client()?.get_data::<ClientState>()?.sandbox.clone()
 }
 
 fn shell_key_route(shell: &mut impl Shell, key: &KeyInput, consumed_release: bool) -> KeyRoute {
