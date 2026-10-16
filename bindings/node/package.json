@@ -36,7 +36,7 @@
     "example": "node examples/engine.mts"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.10.6",
+    "@napi-rs/cli": "^3.10.8",
     "@types/node": "^26.6.4",
     "typescript": "^7.0.2"
   }
