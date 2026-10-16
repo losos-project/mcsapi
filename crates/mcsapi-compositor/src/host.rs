@@ -2697,18 +2697,22 @@ impl<S: Shell> Host<S> {
                 );
             }
         }
-        // Fill the whole content area, not only what the app laid out.
+        // Fill the whole content area, not only what the app laid out,
+        // unless the app's own opaque panels already cover it: most do, and
+        // filling under them filled every window twice each frame.
         let area = egui::Rect::from_min_size(
             egui::pos2(g.loc.x as f32, g.loc.y as f32),
             egui::vec2(g.size.w as f32, g.size.h as f32),
         );
-        output.shapes.insert(
-            0,
-            egui::epaint::ClippedShape {
-                clip_rect: area,
-                shape: egui::Shape::rect_filled(area, 0, theme.background),
-            },
-        );
+        if !covers(&output.shapes, g) {
+            output.shapes.insert(
+                0,
+                egui::epaint::ClippedShape {
+                    clip_rect: area,
+                    shape: egui::Shape::rect_filled(area, 0, theme.background),
+                },
+            );
+        }
         let new_title = (app.title() != title.as_str()).then(|| app.title().to_owned());
         let pass = Pass {
             primitives: egui.ctx.tessellate(output.shapes, output.pixels_per_point),
@@ -2856,6 +2860,41 @@ impl<S: Shell> Host<S> {
         let cursor_drawn =
             self.cursors
                 .drawn(renderer, on_client, self.pointer, self.start.elapsed());
+
+        // The background is drawn only where no opaque window covers it.
+        // Under two tiled windows the wallpaper was filled in full every
+        // frame and almost none of it seen; on a GPU at its lowest clock it
+        // was the costliest layer of the frame. In-process apps are opaque
+        // over their content area, which is filled with the theme's
+        // background, and clients say where they are opaque. A moving
+        // window is drawn elsewhere, so it covers nothing.
+        let opaque_apps = self.shell.theme().background.is_opaque();
+        let mut covered = Vec::new();
+        for (i, p) in placements.iter().enumerate() {
+            if p.motion.is_some() {
+                continue;
+            }
+            match self.windows.get(&p.window) {
+                Some(Content::Internal { .. }) if opaque_apps && contents[i].is_some() => {
+                    covered.push(p.client.to_physical(1));
+                }
+                Some(Content::Wayland(_)) => {
+                    for element in &surfaces[i].1 {
+                        let at = element.geometry(scale).loc;
+                        covered.extend(
+                            element
+                                .opaque_regions(scale)
+                                .iter()
+                                .map(|r| Rectangle::new(r.loc + at, r.size)),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !covered.is_empty() {
+            clip_pass(&mut background, &full.subtract_rects(covered));
+        }
 
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
         frame.clear(Color32F::new(0.06, 0.09, 0.16, 1.0), &[full])?;
@@ -3224,6 +3263,60 @@ fn move_pass(pass: &mut Pass, window: Geometry, m: Motion) {
             }
         }
     }
+}
+
+/// Whether `shapes` paint all of `area` opaquely with plain square
+/// rectangles, such as an app's panels, so nothing under them shows.
+fn covers(shapes: &[egui::epaint::ClippedShape], area: Geometry) -> bool {
+    let opaque = shapes.iter().filter_map(|clipped| match &clipped.shape {
+        egui::Shape::Rect(r)
+            if r.fill.is_opaque()
+                && r.corner_radius == egui::CornerRadius::ZERO
+                && r.brush.is_none()
+                && r.blur_width == 0.0 =>
+        {
+            // Only whole pixels the rectangle fills count.
+            let rect = r.rect.intersect(clipped.clip_rect);
+            let (min, max) = (rect.min.ceil(), rect.max.floor());
+            (max.x > min.x && max.y > min.y).then(|| {
+                Geometry::new(
+                    (min.x as i32, min.y as i32).into(),
+                    ((max.x - min.x) as i32, (max.y - min.y) as i32).into(),
+                )
+            })
+        }
+        _ => None,
+    });
+    area.subtract_rects(opaque).is_empty()
+}
+
+/// Keeps `pass` to `areas`: each primitive is drawn once for every area it
+/// overlaps, scissored to it, and not at all outside them. Its texture
+/// updates stay, so the textures are kept up to date either way.
+fn clip_pass(pass: &mut Pass, areas: &[Rectangle<i32, Physical>]) {
+    let areas: Vec<egui::Rect> = areas
+        .iter()
+        .map(|a| {
+            egui::Rect::from_min_size(
+                egui::pos2(a.loc.x as f32, a.loc.y as f32),
+                egui::vec2(a.size.w as f32, a.size.h as f32),
+            )
+        })
+        .collect();
+    pass.primitives = std::mem::take(&mut pass.primitives)
+        .into_iter()
+        .flat_map(|p| {
+            areas
+                .iter()
+                .map(|area| p.clip_rect.intersect(*area))
+                .filter(|clip| clip.is_positive())
+                .map(|clip_rect| egui::ClippedPrimitive {
+                    clip_rect,
+                    primitive: p.primitive.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
 }
 
 /// Draws the pointer, which the frame paints last (the nested window hides
@@ -3801,6 +3894,61 @@ impl<S: Shell + 'static> PrimarySelectionHandler for Host<S> {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn opaque_panels_cover_an_app_but_gaps_and_glass_do_not() {
+        let area = Geometry::new((10, 20).into(), (100, 50).into());
+        let rect = |x0: f32, x1: f32, fill: egui::Color32| egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::EVERYTHING,
+            shape: egui::Shape::rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, 20.0), egui::pos2(x1, 70.0)),
+                0,
+                fill,
+            ),
+        };
+        let panel = egui::Color32::from_rgb(20, 20, 30);
+        // A side panel and a central panel meeting at x = 40.
+        assert!(covers(
+            &[rect(10.0, 40.0, panel), rect(40.0, 110.0, panel)],
+            area
+        ));
+        // A pixel-wide gap between them.
+        assert!(!covers(
+            &[rect(10.0, 39.5, panel), rect(40.5, 110.0, panel)],
+            area
+        ));
+        // A translucent panel lets what is under it show.
+        let glass = egui::Color32::from_black_alpha(200);
+        assert!(!covers(
+            &[rect(10.0, 40.0, panel), rect(40.0, 110.0, glass)],
+            area
+        ));
+    }
+
+    #[test]
+    fn a_clipped_pass_is_drawn_only_in_its_areas() {
+        let mesh = |n| egui::ClippedPrimitive {
+            clip_rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)),
+            primitive: egui::epaint::Primitive::Mesh(egui::epaint::Mesh {
+                indices: vec![n],
+                ..Default::default()
+            }),
+        };
+        let mut pass = Pass {
+            primitives: vec![mesh(1), mesh(2)],
+            textures: Default::default(),
+        };
+        // The screen less a window over its right half, and an area
+        // outside the primitives' clip.
+        let shown = [
+            Rectangle::new((0, 0).into(), (50, 100).into()),
+            Rectangle::new((200, 0).into(), (10, 10).into()),
+        ];
+        clip_pass(&mut pass, &shown);
+        let clips: Vec<_> = pass.primitives.iter().map(|p| p.clip_rect).collect();
+        let left = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(50.0, 100.0));
+        assert_eq!(clips, [left, left]);
+    }
 
     #[test]
     fn frames_keep_their_rate_however_long_they_take() {
