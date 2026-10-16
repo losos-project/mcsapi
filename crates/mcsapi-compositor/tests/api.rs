@@ -77,6 +77,21 @@ fn frames_follow_the_refresh_rate() {
         hz(144, true).interval_for(30),
         Duration::from_nanos(33_333_333)
     );
+    // At least the target: as few refreshes as keep it, never fewer frames.
+    for (refresh, periods) in [(60, 1), (90, 1), (120, 2), (144, 2), (165, 2), (240, 4)] {
+        assert_eq!(
+            hz(refresh, false).interval_at_least(60),
+            hz(refresh, false).refresh_interval() * periods
+        );
+    }
+    assert_eq!(
+        hz(48, false).interval_at_least(60),
+        hz(48, false).refresh_interval()
+    );
+    assert_eq!(
+        hz(144, true).interval_at_least(60),
+        Duration::from_nanos(16_666_666)
+    );
     // Nonsense refresh rates fall back to something sane.
     assert!(hz(0, false).refresh_interval() <= Duration::from_secs(1));
 }

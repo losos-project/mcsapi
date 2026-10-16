@@ -84,6 +84,7 @@ pub mod a11y;
 #[cfg(feature = "atspi")]
 mod atspi;
 mod blur;
+mod frames;
 mod host;
 mod hot;
 #[cfg(feature = "kms")]
@@ -330,6 +331,25 @@ impl OutputTiming {
             .refresh_mhz
             .max(1_000)
             .div_ceil(fps.max(1).saturating_mul(1_000));
+        refresh * periods
+    }
+
+    /// The frame interval for the fewest frames per second this output can
+    /// show evenly that is still at least `fps`, or every refresh when the
+    /// display is no faster than that. With VRR that is simply `1/fps`.
+    /// Without it, the longest whole number of refresh periods that stays
+    /// at or over `fps`: for 60 fps, every refresh at 60 or 90 Hz, every
+    /// second at 120, 144 (72 fps) or 165 Hz (82.5 fps), every fourth at 240.
+    pub fn interval_at_least(&self, fps: u32) -> Duration {
+        let refresh = self.refresh_interval();
+        let wanted = Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)));
+        if wanted <= refresh {
+            return refresh;
+        }
+        if self.vrr {
+            return wanted;
+        }
+        let periods = (self.refresh_mhz.max(1_000) / fps.max(1).saturating_mul(1_000)).max(1);
         refresh * periods
     }
 }
