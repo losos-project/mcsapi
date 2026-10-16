@@ -132,6 +132,7 @@ use smithay::{
 };
 
 use self::input::TabletInput;
+use crate::frames::FrameStats;
 use crate::{
     Apps, Blur, Capture, ClientRequest, Command, Compositor, GestureEvent, Input, InstanceId, Job,
     KeyInput, KeyRoute, Modifiers, Motion, MouseButton, OutputTiming, Placement, Press, Reserved,
@@ -393,6 +394,8 @@ pub(crate) struct Host<S: Shell> {
     /// Refresh rate of the monitor showing the session window.
     refresh_mhz: u32,
     timing_checked: Option<Instant>,
+    /// Frame times for the log, while it wants them.
+    frames: FrameStats,
 
     shell: S,
     apps: Option<Box<dyn Apps>>,
@@ -736,6 +739,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         vrr,
         refresh_mhz,
         timing_checked: None,
+        frames: FrameStats::default(),
         shell,
         apps,
         windows: HashMap::new(),
@@ -849,12 +853,22 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
     )?;
     event_loop
         .handle()
-        .insert_source(Timer::immediate(), |_, _, host| {
-            host.render();
-            let interval = host.shell.frame_interval(&host.timing());
-            TimeoutAction::ToDuration(
-                interval.clamp(Duration::from_millis(4), Duration::from_secs(1)),
-            )
+        .insert_source(Timer::immediate(), |deadline, _, host| {
+            let start = Instant::now();
+            let drawn = host.render();
+            let interval = host
+                .shell
+                .frame_interval(&host.timing())
+                .clamp(Duration::from_millis(4), Duration::from_secs(1));
+            if FrameStats::enabled() {
+                if drawn {
+                    host.frames.drawn(start, start.elapsed());
+                } else {
+                    host.frames.skipped();
+                }
+                host.frames.report(Instant::now(), interval);
+            }
+            TimeoutAction::ToInstant(next_tick(deadline, interval, Instant::now()))
         })?;
 
     let run_result = event_loop.run(None, &mut host, |host| {
@@ -872,6 +886,26 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
     }
     run_result?;
     Ok(())
+}
+
+/// When the frame after the one due at `deadline` is due: a whole number
+/// of `interval`s on, so frames keep the rate the shell asked for however
+/// long each takes to draw. Counting from the end of drawing instead added
+/// the drawing time to every frame: 16.7 ms frames that took 6 ms to draw
+/// came at 44 fps, not 60. Ticks a slow frame overran are skipped rather
+/// than drawn back to back, and after a long stall (a suspend, a VT switch)
+/// the count starts again from now.
+pub(crate) fn next_tick(deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    let next = deadline + interval;
+    if next > now {
+        return next;
+    }
+    let behind = now - deadline;
+    if behind > Duration::from_secs(1) {
+        return now + interval;
+    }
+    let missed = behind.as_nanos() / interval.as_nanos().max(1);
+    deadline + interval * (missed as u32 + 1)
 }
 
 impl<S: Shell> Host<S> {
@@ -2454,12 +2488,12 @@ impl<S: Shell> Host<S> {
     }
 
     /// Draws one frame: background, then per window its decoration and
-    /// content, then the chrome and the pointer.
-    fn render(&mut self) {
+    /// content, then the chrome and the pointer. Whether it drew one.
+    fn render(&mut self) -> bool {
         // Nothing is drawn while output power has the display off.
         if !self.backend.can_draw() || !self.output_config.powered {
             self.run_commands();
-            return;
+            return false;
         }
         self.update_refresh();
         self.shell.tick();
@@ -2587,6 +2621,7 @@ impl<S: Shell> Host<S> {
             });
         }
         self.run_commands();
+        true
     }
 
     fn paint_only(
@@ -3766,6 +3801,24 @@ impl<S: Shell + 'static> PrimarySelectionHandler for Host<S> {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn frames_keep_their_rate_however_long_they_take() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let frame = ms(16);
+        // Drawn in 6 ms: the next is still 16 ms after this one was due.
+        assert_eq!(next_tick(t0, frame, t0 + ms(6)), t0 + frame);
+        // Due late by 3 ms and drawn in 6: the rate holds, not the delay.
+        assert_eq!(next_tick(t0, frame, t0 + ms(9)), t0 + frame);
+        // 40 ms to draw: the ticks it overran are skipped, not drawn at once.
+        assert_eq!(next_tick(t0, frame, t0 + ms(40)), t0 + ms(48));
+        // Exactly on a tick: that one is gone, so the one after.
+        assert_eq!(next_tick(t0, frame, t0 + ms(32)), t0 + ms(48));
+        // Back from a suspend: count from now.
+        let back = t0 + Duration::from_secs(30);
+        assert_eq!(next_tick(t0, frame, back), back + frame);
+    }
 
     #[test]
     fn a_moved_pass_is_stretched_and_faded() {
