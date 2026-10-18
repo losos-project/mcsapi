@@ -12,7 +12,7 @@ use std::{
     },
     process::{Child, Command as Process},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -257,18 +257,50 @@ struct Egui {
 }
 
 impl Egui {
-    fn new() -> Self {
-        Self {
-            ctx: egui::Context::default(),
-            painter: None,
-        }
+    /// A context whose requests to be drawn again go to `repaint`.
+    fn new(repaint: &Repaint) -> Self {
+        let ctx = egui::Context::default();
+        repaint.watch(&ctx);
+        Self { ctx, painter: None }
     }
 
     /// A context that also builds an AccessKit tree each frame.
-    fn accessible() -> Self {
-        let egui = Self::new();
+    fn accessible(repaint: &Repaint) -> Self {
+        let egui = Self::new(repaint);
         egui.ctx.enable_accesskit();
         egui
+    }
+}
+
+/// When the soonest of the host's egui contexts wants to be drawn again.
+/// egui asks from inside a pass, for an animation's next step or a
+/// tooltip's delay, and from other threads, as an app does when work it
+/// waited on finishes; each context's repaint callback brings both here.
+#[derive(Clone, Default)]
+struct Repaint(Arc<Mutex<Option<Instant>>>);
+
+impl Repaint {
+    fn watch(&self, ctx: &egui::Context) {
+        let due = self.0.clone();
+        ctx.set_request_repaint_callback(move |info| {
+            // `Duration::MAX` and its like mean never.
+            let Some(at) = Instant::now().checked_add(info.delay) else {
+                return;
+            };
+            let mut due = due.lock().unwrap_or_else(|e| e.into_inner());
+            *due = Some(due.map_or(at, |d| d.min(at)));
+        });
+    }
+
+    /// Whether a context wants drawing by `by`; if so the request is spent.
+    /// One further off stays for its own tick.
+    fn take_due(&self, by: Instant) -> bool {
+        let mut due = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let ready = due.is_some_and(|at| at <= by);
+        if ready {
+            *due = None;
+        }
+        ready
     }
 }
 
@@ -406,6 +438,13 @@ pub(crate) struct Host<S: Shell> {
 
     chrome: Egui,
     decorations: Egui,
+    /// Shared by every egui context's repaint callback.
+    repaint: Repaint,
+    /// Something on screen may have changed since the last frame: input
+    /// arrived, a client sent a request, a job or command ran. A tick draws
+    /// only when this holds, egui asked for a frame, or the shell needs one
+    /// ([`Shell::needs_frame`]).
+    dirty: bool,
     chrome_events: Vec<egui::Event>,
     /// When the chrome's queued presses and releases happened.
     chrome_clicks: mcsapi_ui::ClickTiming,
@@ -640,6 +679,9 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
     event_loop.handle().insert_source(
         Generic::new(display, Interest::READ, CalloopMode::Level),
         |_, display, host| {
+            // Most requests change what is shown, and an idle client sends
+            // none, so any of them is reason enough to draw.
+            host.dirty = true;
             // SAFETY: the display outlives the event loop's sources.
             unsafe { display.get_mut().dispatch_clients(host)? };
             Ok(PostAction::Continue)
@@ -675,6 +717,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
     };
 
     let primary_selection_state = PrimarySelectionState::new::<Host<S>>(&dh);
+    let repaint = Repaint::default();
     let mut host = Host {
         start: Instant::now(),
         display: dh.clone(),
@@ -745,8 +788,10 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         windows: HashMap::new(),
         unmanaged: Vec::new(),
         keyboard_focus: None,
-        chrome: Egui::accessible(),
-        decorations: Egui::new(),
+        chrome: Egui::accessible(&repaint),
+        decorations: Egui::new(&repaint),
+        repaint,
+        dirty: true,
         chrome_events: Vec::new(),
         chrome_clicks: Default::default(),
         chrome_access: None,
@@ -783,6 +828,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
             .handle()
             .insert_source(requests, |event, _, host| {
                 if let channel::Event::Msg(request) = event {
+                    host.dirty = true;
                     host.atspi_request(request);
                     host.run_commands();
                 }
@@ -815,6 +861,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
             DrmEvent::Error(e) => error!(error = %e, "DRM error"),
         })?;
         handle.insert_source(sources.session, |event, _, host| {
+            host.dirty = true;
             if let Backend::Kms(k) = &mut host.backend {
                 match event {
                     SessionEvent::PauseSession => k.pause(),
@@ -827,6 +874,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         event_loop.handle().insert_source(jobs, |event, _, host| {
             if let channel::Event::Msg(job) = event {
                 let job: Job<S> = job;
+                host.dirty = true;
                 job(&mut host.shell);
                 host.run_commands();
             }
@@ -855,16 +903,13 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         .handle()
         .insert_source(Timer::immediate(), |deadline, _, host| {
             let start = Instant::now();
-            let drawn = host.render();
-            let interval = host
-                .shell
-                .frame_interval(&host.timing())
-                .clamp(Duration::from_millis(4), Duration::from_secs(1));
+            let tick = host.render();
+            let interval = host.frame_interval();
             if FrameStats::enabled() {
-                if drawn {
-                    host.frames.drawn(start, start.elapsed());
-                } else {
-                    host.frames.skipped();
+                match tick {
+                    Tick::Drawn => host.frames.drawn(start, start.elapsed()),
+                    Tick::Busy => host.frames.skipped(),
+                    Tick::Idle => host.frames.idle(),
                 }
                 host.frames.report(Instant::now(), interval);
             }
@@ -886,6 +931,16 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
     }
     run_result?;
     Ok(())
+}
+
+/// What one tick of the frame timer did.
+enum Tick {
+    /// Drew a frame.
+    Drawn,
+    /// Drew nothing: the display was off or had frames enough queued.
+    Busy,
+    /// Drew nothing: nothing on screen changed.
+    Idle,
 }
 
 /// When the frame after the one due at `deadline` is due: a whole number
@@ -920,6 +975,7 @@ impl<S: Shell> Host<S> {
             if commands.is_empty() {
                 return;
             }
+            self.dirty = true;
             for command in commands {
                 match command {
                     Command::Launch(app) => self.launch(&app),
@@ -969,6 +1025,7 @@ impl<S: Shell> Host<S> {
     }
 
     fn launch(&mut self, name: &str) {
+        self.dirty = true;
         if let Some(apps) = &mut self.apps
             && let Some(app) = apps.resolve(name)
         {
@@ -983,7 +1040,7 @@ impl<S: Shell> Host<S> {
                         id,
                         Content::Internal {
                             instance,
-                            egui: Egui::accessible(),
+                            egui: Egui::accessible(&self.repaint),
                             events: Vec::new(),
                             clicks: Default::default(),
                             title,
@@ -1325,6 +1382,8 @@ impl<S: Shell> Host<S> {
     }
 
     fn winit_event(&mut self, event: WinitEvent) {
+        // A resize, input, or the window shown again after being covered.
+        self.dirty = true;
         match event {
             WinitEvent::Resized { size, .. } => {
                 let mode = OutputMode {
@@ -1395,6 +1454,7 @@ impl<S: Shell> Host<S> {
     /// Routes one input event. Generic so a libinput backend, which also
     /// reports touchpad gestures, can share it; winit reports none.
     fn input<B: InputBackend>(&mut self, event: InputEvent<B>) {
+        self.dirty = true;
         self.set_synthetic(false);
         self.seat_activity();
         match event {
@@ -1973,6 +2033,7 @@ impl<S: Shell> Host<S> {
         let Some((window, _)) = self.scroll.take() else {
             return;
         };
+        self.dirty = true;
         let modifiers = self.egui_mods;
         if let Some(events) = self.internal_events(Some(window)) {
             events.push(egui::Event::MouseWheel {
@@ -2487,13 +2548,36 @@ impl<S: Shell> Host<S> {
         }
     }
 
+    /// The time until the next tick, as the shell asks for it.
+    fn frame_interval(&self) -> Duration {
+        self.shell
+            .frame_interval(&self.timing())
+            .clamp(Duration::from_millis(4), Duration::from_secs(1))
+    }
+
+    /// Whether this tick draws a frame (see [`Host::dirty`]).
+    fn frame_wanted(&mut self) -> bool {
+        // Asked every tick, not only when nothing else wants a frame, so
+        // the shell can keep track of what it last showed.
+        let shell = self.shell.needs_frame();
+        // A request due before the tick after this one is drawn now; that
+        // tick would come later than it asked for.
+        let by = Instant::now() + self.frame_interval() / 2;
+        let egui = self.repaint.take_due(by);
+        // The agent's queue moves one command per frame, and its reads wait
+        // for the frames that show what came before them.
+        let agent = !self.agent_queue.is_empty() || self.settle > 0 || !self.captures.is_empty();
+        self.dirty || shell || egui || agent
+    }
+
     /// Draws one frame: background, then per window its decoration and
-    /// content, then the chrome and the pointer. Whether it drew one.
-    fn render(&mut self) -> bool {
+    /// content, then the chrome and the pointer, when something on screen
+    /// may have changed.
+    fn render(&mut self) -> Tick {
         // Nothing is drawn while output power has the display off.
         if !self.backend.can_draw() || !self.output_config.powered {
             self.run_commands();
-            return false;
+            return Tick::Busy;
         }
         self.update_refresh();
         self.shell.tick();
@@ -2506,6 +2590,13 @@ impl<S: Shell> Host<S> {
         self.run_commands();
         self.agent_step();
         self.sync();
+        if !self.frame_wanted() {
+            // A commit timer still falls due, and a fifo barrier still
+            // clears, with nothing to draw.
+            self.release_barriers();
+            return Tick::Idle;
+        }
+        self.dirty = false;
         let size = self.backend.size();
         let screen =
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size.w as f32, size.h as f32));
@@ -2587,6 +2678,8 @@ impl<S: Shell> Host<S> {
             cursor,
         );
         self.frame_drawn(drawn.is_ok());
+        // A frame that failed is tried again on the next tick.
+        self.dirty |= drawn.is_err();
         let capture = match drawn {
             Ok(capture) => capture.map(Ok),
             Err(e) => {
@@ -2621,7 +2714,7 @@ impl<S: Shell> Host<S> {
             });
         }
         self.run_commands();
-        true
+        Tick::Drawn
     }
 
     fn paint_only(
@@ -3548,6 +3641,9 @@ impl<S: Shell + 'static> CompositorHandler for Host<S> {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Also reached outside a client's dispatch, when a commit that
+        // waited on its buffer's fences or a commit timer is applied.
+        self.dirty = true;
         on_commit_buffer_handler::<Self>(surface);
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
@@ -3894,6 +3990,41 @@ impl<S: Shell + 'static> PrimarySelectionHandler for Host<S> {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn egui_repaint_requests_come_due_once() {
+        let repaint = Repaint::default();
+        let ctx = egui::Context::default();
+        repaint.watch(&ctx);
+        // A pass with nothing in it; its font atlas upload is dropped.
+        let pass = |ctx: &egui::Context| {
+            ctx.run_ui(egui::RawInput::default(), |_| {})
+                .textures_delta
+                .clear();
+        };
+        // A new context asks for its first frames itself; once it settles,
+        // a pass that asks for nothing leaves nothing due...
+        pass(&ctx);
+        let mut passes = 1;
+        while repaint.take_due(Instant::now()) {
+            pass(&ctx);
+            passes += 1;
+            assert!(passes < 10, "an empty context kept asking for frames");
+        }
+        assert!(passes > 1);
+        assert!(!repaint.take_due(Instant::now() + Duration::from_secs(3600)));
+        // ...and one asked for later comes due then, not before.
+        ctx.request_repaint_after(Duration::from_secs(10));
+        assert!(!repaint.take_due(Instant::now() + Duration::from_secs(5)));
+        assert!(repaint.take_due(Instant::now() + Duration::from_secs(11)));
+        assert!(!repaint.take_due(Instant::now() + Duration::from_secs(11)));
+        // From another thread, as an app's worker asks.
+        let other = ctx.clone();
+        std::thread::spawn(move || other.request_repaint())
+            .join()
+            .unwrap();
+        assert!(repaint.take_due(Instant::now()));
+    }
 
     #[test]
     fn opaque_panels_cover_an_app_but_gaps_and_glass_do_not() {

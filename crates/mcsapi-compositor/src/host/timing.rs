@@ -172,6 +172,13 @@ impl<S: Shell + 'static> Host<S> {
                 feedback.discarded();
             }
         }
+        self.release_barriers();
+    }
+
+    /// Clears the clients' fifo barriers and the commit timers due before
+    /// the next refresh, after each frame and each tick that drew none.
+    pub(super) fn release_barriers(&mut self) {
+        let now = self.timing.clock.now();
         // Timers due before the next refresh can show their commit in it.
         let period = match refresh(self.refresh_mhz, self.vrr) {
             Refresh::Fixed(p) | Refresh::Variable(p) => p,

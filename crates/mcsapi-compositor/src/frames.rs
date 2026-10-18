@@ -27,6 +27,8 @@ pub(crate) struct FrameStats {
     draws: Vec<Duration>,
     /// Ticks that found the display still busy with earlier frames.
     skipped: u32,
+    /// Ticks that drew nothing because nothing on screen changed.
+    idle: u32,
 }
 
 /// One window's frames, summed up.
@@ -62,6 +64,14 @@ impl FrameStats {
         self.skipped += 1;
     }
 
+    /// A tick drew nothing because nothing on screen changed. The next
+    /// frame's period is not counted: a pause is not a slow frame.
+    pub(crate) fn idle(&mut self) {
+        self.since.get_or_insert_with(Instant::now);
+        self.last = None;
+        self.idle += 1;
+    }
+
     /// Logs a summary once a window is over; `target` is the frame interval
     /// the shell asked for.
     pub(crate) fn report(&mut self, now: Instant, target: Duration) {
@@ -85,6 +95,17 @@ impl FrameStats {
                 draw_max_ms = ms(s.draw[2]),
                 late = s.late,
                 skipped = self.skipped,
+                idle = self.idle,
+                "frames"
+            );
+        } else {
+            // Too few frames in a row for periods: an idle screen.
+            debug!(
+                target: "mcsapi_compositor::frames",
+                fps = format_args!("{:.1}", self.draws.len() as f64 / span.as_secs_f64()),
+                target_fps = format_args!("{:.1}", 1.0 / target.as_secs_f64()),
+                skipped = self.skipped,
+                idle = self.idle,
                 "frames"
             );
         }

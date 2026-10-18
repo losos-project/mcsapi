@@ -115,6 +115,10 @@ impl<S: Shell> Shell for Hot<S> {
         hot!(S::tick, &mut self.0)
     }
 
+    fn needs_frame(&mut self) -> bool {
+        hot!(S::needs_frame, &mut self.0)
+    }
+
     fn chrome_wants_pointer(&self, at: (i32, i32)) -> bool {
         hot!(S::chrome_wants_pointer, &self.0, at)
     }
