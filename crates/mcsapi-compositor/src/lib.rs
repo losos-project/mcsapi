@@ -659,6 +659,24 @@ pub trait Shell: 'static {
     /// Called about every frame for clocks and other polled state.
     fn tick(&mut self) {}
 
+    /// Whether something the shell paints changed in a way the host cannot
+    /// see, asked every tick right after [`Shell::tick`]: a clock's minute
+    /// turned, a background thread answered, a window is sliding. The host
+    /// draws a frame only when this holds, or input, a client, a
+    /// [`Command`] or a job changed something, or one of its egui contexts
+    /// asked to be drawn again (`egui::Context::request_repaint` and
+    /// `request_repaint_after`, as an animation or an app waiting on a
+    /// thread does). Otherwise the screen keeps the last frame and nothing
+    /// is drawn: drawing every tick cost a whole frame of GPU (or, on a
+    /// software renderer, CPU) work sixty times a second while nothing on
+    /// screen moved.
+    ///
+    /// The default draws every tick, for shells that keep state of their
+    /// own that their chrome shows.
+    fn needs_frame(&mut self) -> bool {
+        true
+    }
+
     /// Whether the chrome owns the pointer at `at` (bars, overlays).
     fn chrome_wants_pointer(&self, _at: (i32, i32)) -> bool {
         false
