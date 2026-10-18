@@ -23,7 +23,7 @@ documented = "0.10"
 gpui = { workspace = true, optional = true }
 gpui_macros = { workspace = true, optional = true }
 gpui_util = { workspace = true, optional = true }
-itertools = "0.14.0"
+itertools = "0.15.0"
 log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
 mcsapi-zed-component.workspace = true
 mcsapi-zed-icons.workspace = true
