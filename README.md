@@ -109,7 +109,7 @@ Debian/Ubuntu its build prerequisites include `libwayland-dev`,
 `libxkbcommon-dev`, `libxkbcommon-x11-dev`, `libfontconfig1-dev`,
 `libssl-dev`, and `libvulkan-dev`, plus a C/C++ compiler and `pkg-config`.
 Runtime use also requires a display and compatible graphics drivers.
-GPUI is Zed's in-tree GPUI from Sonne (`github.com/dasmatus/sonne`), pinned by
+GPUI is Zed's in-tree GPUI (`github.com/zed-industries/zed`), pinned by
 revision in the workspace `Cargo.toml`, with `gpui_platform` choosing Wayland
 or X11 at run time. A git dependency's `[patch]` section does not reach the
 workspace that depends on it, so a workspace building GPUI repeats Zed's

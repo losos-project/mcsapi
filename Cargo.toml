@@ -21,18 +21,21 @@ mcsapi-hardened-malloc = { path = "crates/mcsapi-hardened-malloc", version = "0.
 egui = "0.36.2"
 serde_json = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
-# Zed's in-tree GPUI as carried by Sonne, not the crates.io release: Zed's
-# `ui` components (vendored as mcsapi-zed-ui) are written against it. GPUI no
-# longer contains a platform; `gpui_platform` picks Wayland or X11 at run time.
-gpui = { git = "https://github.com/dasmatus/sonne", rev = "b0f67b3b07b28f88151e6f88044ada8d7c4ffb75", default-features = false, features = ["font-kit", "wayland", "x11"] }
-gpui_platform = { git = "https://github.com/dasmatus/sonne", rev = "b0f67b3b07b28f88151e6f88044ada8d7c4ffb75", features = ["font-kit", "wayland", "x11"] }
-# Sonne crates the vendored Zed components use alongside GPUI, at GPUI's
-# revision so they share its types.
-collections = { git = "https://github.com/dasmatus/sonne", rev = "b0f67b3b07b28f88151e6f88044ada8d7c4ffb75" }
-gpui_macros = { git = "https://github.com/dasmatus/sonne", rev = "b0f67b3b07b28f88151e6f88044ada8d7c4ffb75" }
-gpui_util = { git = "https://github.com/dasmatus/sonne", rev = "b0f67b3b07b28f88151e6f88044ada8d7c4ffb75" }
-refineable = { git = "https://github.com/dasmatus/sonne", rev = "b0f67b3b07b28f88151e6f88044ada8d7c4ffb75" }
-syntax_theme = { git = "https://github.com/dasmatus/sonne", rev = "b0f67b3b07b28f88151e6f88044ada8d7c4ffb75" }
+# Zed's in-tree GPUI, not the crates.io release: Zed's `ui` components
+# (vendored as mcsapi-zed-ui) are written against it. GPUI no longer contains
+# a platform; `gpui_platform` picks Wayland or X11 at run time. This is the
+# upstream commit Sonne's fork was based on. It came from Sonne until that
+# repository stopped being public; nothing here used the fork's two changes,
+# its mcsapi window backend and `Background::paint`.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "a84689073d296dfd39987bc7dd478e43ef76d83a", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a84689073d296dfd39987bc7dd478e43ef76d83a", features = ["font-kit", "wayland", "x11"] }
+# Zed crates the vendored components use alongside GPUI, at GPUI's revision
+# so they share its types.
+collections = { git = "https://github.com/zed-industries/zed", rev = "a84689073d296dfd39987bc7dd478e43ef76d83a" }
+gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "a84689073d296dfd39987bc7dd478e43ef76d83a" }
+gpui_util = { git = "https://github.com/zed-industries/zed", rev = "a84689073d296dfd39987bc7dd478e43ef76d83a" }
+refineable = { git = "https://github.com/zed-industries/zed", rev = "a84689073d296dfd39987bc7dd478e43ef76d83a" }
+syntax_theme = { git = "https://github.com/zed-industries/zed", rev = "a84689073d296dfd39987bc7dd478e43ef76d83a" }
 # Zed's component stack, copied from Sonne. Each keeps Zed's library name
 # (`ui`, `theme`, ...) so the copied sources compile unchanged.
 mcsapi-zed-component = { path = "crates/mcsapi-zed-component", version = "0.1.0" }
