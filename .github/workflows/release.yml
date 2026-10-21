@@ -1,0 +1,78 @@
+# Publishes mcsapi's GitHub releases on the OS's cadences, through
+# .github/release, which says how tags, titles and names are made.
+#
+# `nightly` wakes when CI finishes a push to main and, if it passed, releases
+# that commit as nightly-<stamp>, with its source as an archive. `cadences`
+# runs daily at 02:17 UTC, the minute the OS's own cadence.yml runs, so a
+# weekly release here is out before the OS's Monday 03:00 lockfile update
+# reads it, and cuts the weekly, monthly and yearly releases due from the
+# newest nightly.
+name: release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nightly:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # One at a time, so a nightly and a cadence never read the releases
+    # while the other is making one. On the jobs, not the workflow, because
+    # every pull request's CI wakes this workflow too and would take the
+    # group's one waiting place from a release.
+    concurrency:
+      group: releases
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      # The default branch, which is where this workflow and the release
+      # script are read from, with its history, which holds the commit
+      # released: CI ran on a push to it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - name: Publish the nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          version=$(TZ=UTC0 git show -s --format=%cd --date=format-local:%Y%m%d.%H%M%S "$SHA")
+          mkdir "$RUNNER_TEMP/files"
+          git archive --format=tar.gz --prefix="${GH_REPO#*/}-$version/" \
+            -o "$RUNNER_TEMP/files/${GH_REPO#*/}-$version.tar.gz" "$SHA"
+          .github/release nightly "$SHA" "$RUNNER_TEMP/files"
+
+  cadences:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: releases
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/release
+      - name: Cut the releases that are due
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/release cadences
