@@ -30,6 +30,12 @@ jobs:
       github.event.workflow_run.head_branch == github.event.repository.default_branch
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # One publisher per commit, so a re-run cannot delete the draft another
+    # run of it is still uploading to. Other commits' nightlies make other
+    # tags and run alongside.
+    concurrency:
+      group: nightly-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -54,6 +60,11 @@ jobs:
     if: github.event_name != 'workflow_run'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # A dispatched check and the scheduled one would publish the same tags;
+    # one waits. A newer waiting one replacing it does the same work.
+    concurrency:
+      group: cadences
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
