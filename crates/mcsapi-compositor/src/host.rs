@@ -3662,6 +3662,7 @@ impl<S: Shell + 'static> CompositorHandler for Host<S> {
         }
         self.manage_on_first_commit(surface);
         self.icon_committed(surface);
+        self.size_committed(surface);
         self.wlr_commit(surface);
         self.input_popup_commit(surface);
         self.popups.commit(surface);
