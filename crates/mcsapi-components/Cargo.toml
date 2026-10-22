@@ -10,3 +10,7 @@ repository.workspace = true
 [dependencies]
 egui.workspace = true
 mcsapi-ui.workspace = true
+
+# A browser has no font files to read; there egui keeps its own fonts.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+fontdb.workspace = true

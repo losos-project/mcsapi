@@ -210,7 +210,7 @@ fn json_string(text: &str) -> String {
 /// {"id":"derisk-dark","name":"Derisk Dark","scheme":"dark",
 ///  "palette":{"background":"#0a0e12",...},
 ///  "tokens":{"background":"#0a0e12",...,"radius":6},
-///  "fonts":{"sans":"Ubuntu",...},"icons":{"theme":"Papirus-Dark",...},
+///  "fonts":{"sans":"Inter",...},"icons":{"theme":"Papirus-Dark",...},
 ///  "portal":{"color_scheme":1,"accent_color":[0.28,0.7,0.75],"contrast":0}}
 /// ```
 pub fn json(id: &str, theme: &Theme) -> String {

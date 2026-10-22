@@ -219,7 +219,7 @@ fn exports_carry_the_theme() {
 
     let ini = export::gtk_settings(&Theme::dark());
     assert!(ini.contains("gtk-application-prefer-dark-theme=1"));
-    assert!(ini.contains("gtk-font-name=Ubuntu 10.5"));
+    assert!(ini.contains("gtk-font-name=Inter 10.5"));
 
     let xml = export::android_colors(&Theme::dark());
     assert!(xml.contains("<color name=\"mcsapi_background\">#ff0a0e12</color>"));
@@ -243,7 +243,7 @@ fn exports_carry_the_theme() {
     assert!(css.contains("  --muted-foreground: #949ba4;\n"));
     assert!(css.contains("  --overlay: #000000a0;\n"));
     assert!(css.contains("  --radius: 8px;\n  --radius-control: 6px;\n"));
-    assert!(css.contains("  --font-sans: \"Ubuntu\";\n"));
+    assert!(css.contains("  --font-sans: \"Inter\";\n"));
     assert!(css.ends_with("}\n"));
 }
 

@@ -7,6 +7,8 @@ use mcsapi_ui::{Theme, egui};
 const NOT_SHOWN: &[&str] = &[
     // The theme switcher exercises the tokens on every specimen.
     "Tokens",
+    // The gallery draws every specimen in the fonts it installs.
+    "install_fonts",
 ];
 
 fn frames(context: &egui::Context, gallery: &mut Gallery, count: usize) -> egui::FullOutput {

@@ -101,8 +101,8 @@ pub struct Palette {
 /// Font families and sizes. Sizes are logical pixels.
 ///
 /// Families are names of installed fonts, which GPUI, GTK, Qt and web content
-/// resolve through fontconfig. egui draws with the fonts embedded in it and
-/// only takes the sizes.
+/// resolve through fontconfig. egui draws with the fonts embedded in it unless
+/// the app installs the families with mcsapi-components' `install_fonts`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fonts {
     /// Family for interface text.
@@ -120,11 +120,14 @@ pub struct Fonts {
 }
 
 impl Default for Fonts {
-    /// The fonts egui embeds, so foreign apps match the egui apps.
+    /// The LosOS web interface's letters: Inter at its regular weight, which
+    /// that interface's screenshots and the machines it is tested on draw
+    /// its system font stack with. The monospace family stays egui's Hack,
+    /// which the desktop's terminal draws in its Nerd Font build.
     fn default() -> Self {
         Self {
-            sans: "Ubuntu".to_owned(),
-            sans_weight: 300,
+            sans: "Inter".to_owned(),
+            sans_weight: 400,
             monospace: "Hack".to_owned(),
             size: 14.0,
             small_size: 12.0,
