@@ -22,8 +22,8 @@
 //! destructive = "#dc2626"
 //!
 //! [fonts]
-//! sans = "Ubuntu"
-//! sans_weight = 300
+//! sans = "Inter"
+//! sans_weight = 400
 //! monospace = "Hack"
 //! size = 14
 //! small_size = 12

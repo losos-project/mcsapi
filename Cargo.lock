@@ -4005,6 +4005,7 @@ name = "mcsapi-components"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "fontdb",
  "mcsapi-ui",
 ]
 

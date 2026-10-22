@@ -46,6 +46,7 @@
 mod button;
 mod display;
 mod error;
+mod fonts;
 mod form;
 mod navigation;
 mod overlay;
@@ -59,6 +60,7 @@ pub use display::{
     Spinner, blockquote, typography,
 };
 pub use error::{ErrorAlert, ErrorAlertResponse, ErrorDialog, ErrorDialogResponse};
+pub use fonts::install_fonts;
 pub use form::{Checkbox, Input, RadioGroup, Select, Slider, Switch, Textarea};
 pub use navigation::{
     Collapsible, Pagination, Table, Tabs, accordion_item, breadcrumb, page_window,

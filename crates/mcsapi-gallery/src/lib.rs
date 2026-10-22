@@ -323,6 +323,9 @@ impl App for Gallery {
         self.state.theme = theme;
         let tokens = Tokens::from_theme(&theme);
         tokens.install(ui.ctx());
+        // In the default theme's letters, where they are installed, as the
+        // desktop draws its egui apps.
+        mcsapi_components::install_fonts(ui.ctx(), &mcsapi_ui::theme::Fonts::default());
         ui.ctx().set_visuals(visuals(&theme));
 
         // Laid out like the LosOS web interface: a top bar over the page, a
