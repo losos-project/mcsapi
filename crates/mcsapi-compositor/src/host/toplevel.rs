@@ -7,6 +7,7 @@
 //! - `xdg_wm_dialog_v1`: whether a dialog is modal.
 //! - `xdg_toplevel_icon_manager_v1`: a window's own icon.
 //! - `xdg_toplevel_tag_manager_v1`: a stable tag and a description.
+//! - The size a window's content is committed at.
 //! - `xdg_system_bell_v1`: the bell.
 //! - `xdg_activation_v1`: focus requests that carry a token from a user
 //!   action. The compositor hands out tokens only to the client that has the
@@ -156,6 +157,29 @@ impl<S: Shell + 'static> Host<S> {
         }
     }
 
+    /// After a commit: the shell hears of the size the window's content
+    /// now has when it differs from the last one it heard of.
+    pub(super) fn size_committed(&mut self, surface: &WlSurface) {
+        let Some((id, window)) = self.wayland_window_of(surface) else {
+            return;
+        };
+        let size = window.geometry().size;
+        let size = (size.w, size.h);
+        if size.0 <= 0 || size.1 <= 0 {
+            return;
+        }
+        let changed = with_states(surface, |states| {
+            let last = states
+                .data_map
+                .get_or_insert_threadsafe(CommittedSize::default);
+            let mut last = last.0.lock().unwrap_or_else(|e| e.into_inner());
+            last.replace(size) != Some(size)
+        });
+        if changed {
+            self.shell.window_hint(id, WindowHint::Size(size));
+        }
+    }
+
     /// After a commit: a new icon takes effect with it.
     pub(super) fn icon_committed(&mut self, surface: &WlSurface) {
         if !take_icon_pending(surface) {
@@ -177,6 +201,10 @@ fn is_modal(surface: &WlSurface) -> bool {
             .is_some_and(|d| d.modal)
     })
 }
+
+/// The content size last told to the shell.
+#[derive(Default)]
+struct CommittedSize(std::sync::Mutex<Option<(i32, i32)>>);
 
 /// A toplevel's tag and description. Kept here rather than read from
 /// Smithay's `XdgToplevelTagSurfaceData`, which 0.7 fills with the

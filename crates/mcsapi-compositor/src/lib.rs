@@ -220,6 +220,13 @@ pub enum WindowHint {
     /// A translated, human-readable description of the window
     /// (`xdg_toplevel_tag_v1`), for a screen reader or a window list.
     Description(String),
+    /// The size the window's content was committed at, in logical pixels:
+    /// its xdg window geometry, else what its surfaces cover. Sent when it
+    /// changes. A client may draw a floating window at a size other than
+    /// the one it was configured to, as a fixed-size dialog or a window
+    /// streamed from another system does; a shell fits such a window's
+    /// frame to this so it has no empty space around it.
+    Size((i32, i32)),
 }
 
 /// A window's icon: a name from the icon theme, pixels, or both.
