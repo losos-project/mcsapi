@@ -20,7 +20,7 @@ test = false
 collections = { workspace = true, optional = true }
 gpui = { workspace = true, optional = true }
 inventory = "0.3.19"
-parking_lot = "0.12.1"
+parking_lot = "0.13.0"
 strum = { version = "0.28", features = ["derive"] }
 mcsapi-zed-theme.workspace = true
 

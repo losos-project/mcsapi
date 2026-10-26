@@ -18,11 +18,11 @@ mcsapi-components = { path = "crates/mcsapi-components", version = "0.1.0" }
 mcsapi-components-gpui = { path = "crates/mcsapi-components-gpui", version = "0.1.0" }
 mcsapi-compositor = { path = "crates/mcsapi-compositor", version = "0.1.0" }
 mcsapi-hardened-malloc = { path = "crates/mcsapi-hardened-malloc", version = "0.1.0" }
-egui = "0.36.2"
+egui = "0.37.0"
 # The system's font list, for egui apps to draw the theme's families
 # (mcsapi-components' `install_fonts`). The same release cosmic-text reads it
 # with under GPUI, so the lockfile holds one copy.
-fontdb = "0.23"
+fontdb = "0.24"
 serde_json = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Zed's in-tree GPUI, not the crates.io release: Zed's `ui` components
