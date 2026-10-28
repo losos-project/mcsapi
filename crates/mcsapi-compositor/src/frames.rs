@@ -29,6 +29,9 @@ pub(crate) struct FrameStats {
     skipped: u32,
     /// Ticks that drew nothing because nothing on screen changed.
     idle: u32,
+    /// Frames, among those drawn, that only moved the cursor over the
+    /// scene drawn before.
+    cursor: u32,
 }
 
 /// One window's frames, summed up.
@@ -57,6 +60,12 @@ impl FrameStats {
             self.periods.push(start.saturating_duration_since(last));
         }
         self.draws.push(draw);
+    }
+
+    /// A frame started at `start` only moved the cursor, in `draw`.
+    pub(crate) fn cursor(&mut self, start: Instant, draw: Duration) {
+        self.drawn(start, draw);
+        self.cursor += 1;
     }
 
     /// A tick drew nothing because the display had frames enough queued.
@@ -96,6 +105,7 @@ impl FrameStats {
                 late = s.late,
                 skipped = self.skipped,
                 idle = self.idle,
+                cursor_only = self.cursor,
                 "frames"
             );
         } else {

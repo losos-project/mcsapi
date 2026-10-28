@@ -139,6 +139,7 @@ impl<S: Shell + 'static> SessionLockHandler for Host<S> {
     fn lock(&mut self, confirmation: SessionLocker) {
         let was = self.lock.locked;
         self.lock.locked = true;
+        self.dirty = true;
         self.lock.confirm = Some(confirmation);
         // A press that started before the lock must not finish on what is
         // now hidden.
@@ -153,6 +154,7 @@ impl<S: Shell + 'static> SessionLockHandler for Host<S> {
 
     fn unlock(&mut self) {
         self.lock.locked = false;
+        self.dirty = true;
         self.lock.confirm = None;
         self.lock.surface = None;
         self.shell.session_locked(false);

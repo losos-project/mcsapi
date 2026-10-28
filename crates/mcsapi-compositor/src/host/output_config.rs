@@ -173,6 +173,8 @@ impl<S: Shell + 'static> Host<S> {
             return;
         }
         self.output_config.powered = on;
+        // What the screen showed while off is not trusted to be there.
+        self.dirty = true;
         #[cfg(feature = "kms")]
         if let Backend::Kms(k) = &mut self.backend {
             k.set_power(on);

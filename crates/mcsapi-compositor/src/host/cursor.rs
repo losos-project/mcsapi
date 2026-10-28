@@ -6,7 +6,11 @@
 //! where the theme animates them; without a theme, or for a shape it lacks,
 //! the compositor paints its own arrow.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    time::Duration,
+};
 
 use smithay::backend::input::TabletToolDescriptor;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -25,7 +29,7 @@ use smithay::{
         pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     },
     reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
-    utils::{Logical, Physical, Point, Scale, Size},
+    utils::{Logical, Physical, Point, Rectangle, Scale, Size},
     wayland::{
         compositor::with_states, cursor_shape::CursorShapeManagerState,
         tablet_manager::TabletSeatHandler,
@@ -36,8 +40,9 @@ use tracing::warn;
 use super::Host;
 use crate::{Shell, egui};
 
-/// A frame ready to draw: its texture, hotspot and size.
-type Frame = (GlesTexture, Point<i32, Logical>, Size<i32, Logical>);
+/// A frame ready to draw: its texture, hotspot, size, and which frame of
+/// its animation it is.
+type Frame = (GlesTexture, Point<i32, Logical>, Size<i32, Logical>, usize);
 
 /// One frame of a themed cursor.
 struct Image {
@@ -73,7 +78,46 @@ pub(super) enum Drawn {
         texture: GlesTexture,
         at: Point<i32, Physical>,
         size: Size<i32, Physical>,
+        /// The shape and the frame of its animation, so a frame that moves
+        /// nothing else can tell whether the image changed.
+        id: u64,
     },
+}
+
+impl Drawn {
+    /// Where on screen it is drawn, if it is drawn over the scene rather
+    /// than in it; `None` when hidden or painted by egui.
+    pub(super) fn area(&self) -> Option<Rectangle<i32, Physical>> {
+        match self {
+            Self::Hidden | Self::Painted => None,
+            Self::Surface(elements) => {
+                use smithay::backend::renderer::element::Element as _;
+                elements
+                    .iter()
+                    .map(|e| e.geometry(Scale::from(1.0)))
+                    .reduce(|a, b| a.merge(b))
+            }
+            Self::Image { at, size, .. } => Some(Rectangle::new(*at, *size)),
+        }
+    }
+
+    /// What it shows: the same where only its position changed.
+    pub(super) fn id(&self) -> u64 {
+        match self {
+            Self::Hidden => 0,
+            Self::Painted => 1,
+            Self::Surface(elements) => {
+                let mut hasher = DefaultHasher::new();
+                for e in elements {
+                    use smithay::backend::renderer::element::Element as _;
+                    e.id().hash(&mut hasher);
+                    format!("{:?}", e.current_commit()).hash(&mut hasher);
+                }
+                hasher.finish()
+            }
+            Self::Image { id, .. } => *id,
+        }
+    }
 }
 
 impl Cursors {
@@ -181,7 +225,7 @@ impl Cursors {
                 }
             }
         }
-        Some((frame.texture.clone()?, frame.hotspot, frame.size))
+        Some((frame.texture.clone()?, frame.hotspot, frame.size, index))
     }
 
     /// Decides what to draw at `pointer`: the client's wish while a client
@@ -221,10 +265,15 @@ impl Cursors {
             self.egui
         };
         match self.image(renderer, icon, elapsed) {
-            Some((texture, hotspot, size)) => Drawn::Image {
+            Some((texture, hotspot, size, index)) => Drawn::Image {
                 texture,
                 at: (pointer.to_i32_round() - hotspot).to_physical(1),
                 size: size.to_physical(1),
+                id: {
+                    let mut hasher = DefaultHasher::new();
+                    (icon, index).hash(&mut hasher);
+                    hasher.finish()
+                },
             },
             None => Drawn::Painted,
         }
