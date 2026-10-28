@@ -3122,15 +3122,7 @@ impl<S: Shell> Host<S> {
                     .flat_map(|(behind, _)| behind),
             )
             .collect();
-        let area = area.map(|mut area| {
-            while let Some(b) = reachable.iter().find(|b| {
-                blur_reaches(b, area)
-                    && !area.contains_rect(blur_rect(b).intersection(full).unwrap_or(area))
-            }) {
-                area = area.merge(blur_rect(b)).intersection(full).unwrap_or(full);
-            }
-            area
-        });
+        let area = area.map(|area| grow_over_blurs(area, &reachable, full));
         // Where this frame draws, and where the screen changes: all of it,
         // or the area the surfaces and the blurs they reach changed. Only
         // the blurs inside it are drawn again; the rest are already right.
@@ -3906,6 +3898,25 @@ fn blur_reaches(blur: &Blur, area: Rectangle<i32, Physical>) -> bool {
     .overlaps(area)
 }
 
+/// `area`, grown to take in whole each blur that reaches it, and each blur
+/// those reach in turn, within `screen`.
+fn grow_over_blurs(
+    mut area: Rectangle<i32, Physical>,
+    blurs: &[&Blur],
+    screen: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    while let Some(b) = blurs.iter().find(|b| {
+        blur_reaches(b, area)
+            && !area.contains_rect(blur_rect(b).intersection(screen).unwrap_or(area))
+    }) {
+        area = area
+            .merge(blur_rect(b))
+            .intersection(screen)
+            .unwrap_or(screen);
+    }
+    area
+}
+
 /// Where a blur draws, on the screen.
 fn blur_rect(blur: &Blur) -> Rectangle<i32, Physical> {
     let g = blur.area;
@@ -4470,6 +4481,29 @@ impl<S: Shell + 'static> PrimarySelectionHandler for Host<S> {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn a_change_under_a_blurs_reach_takes_in_that_blur_and_the_ones_it_reaches() {
+        let screen = Rectangle::from_size((1920, 1080).into());
+        let blur = |x, y, w, h| Blur {
+            area: Geometry::new((x, y).into(), (w, h).into()),
+            corner_radius: 0,
+            strength: 5,
+        };
+        // The top bar, a panel under it, and one far away.
+        let bar = blur(0, 0, 1920, 28);
+        let panel = blur(1500, 40, 400, 300);
+        let far = blur(0, 900, 300, 180);
+        let blurs = [&bar, &panel, &far];
+        // A terminal's first line, just under the bar: the bar, and the
+        // panel within its reach, are drawn again; the far one is not.
+        let line = Rectangle::new((0, 41).into(), (12, 13).into());
+        let grown = grow_over_blurs(line, &blurs, screen);
+        assert_eq!(grown, Rectangle::new((0, 0).into(), (1920, 340).into()));
+        // A change out of every blur's reach stays as it is.
+        let middle = Rectangle::new((900, 600).into(), (12, 13).into());
+        assert_eq!(grow_over_blurs(middle, &blurs, screen), middle);
+    }
 
     #[test]
     fn egui_repaint_requests_come_due_once() {
