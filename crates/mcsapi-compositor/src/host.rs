@@ -2819,6 +2819,13 @@ impl<S: Shell> Host<S> {
             self.screen_capture.set_dmabuf(device, &renderable);
         }
         let blits = self.dmabuf_blits();
+        // Windows a capture draws on their own, after the frame.
+        let alone: Vec<WindowId> = self
+            .windows
+            .keys()
+            .copied()
+            .filter(|&id| self.drawn_alone(id))
+            .collect();
         let (renderer, mut framebuffer) = match (&mut self.backend, &mut self.scene) {
             (backend, Some(scene)) if offscreen => {
                 let renderer = backend.renderer();
@@ -3066,7 +3073,7 @@ impl<S: Shell> Host<S> {
         }
         let bare = self
             .screen_capture
-            .wants(false)
+            .wants(false, |id| alone.contains(&id))
             .then(|| read_frame(&gl, screen_px));
         self.screen_capture.draw_dmabuf(&gl, &blits, false, size.h);
         // The arrow's pass also carries texture updates for the shared
@@ -3098,8 +3105,9 @@ impl<S: Shell> Host<S> {
                 )?;
             }
         }
-        let with_cursor = (!self.captures.is_empty() || self.screen_capture.wants(true))
-            .then(|| read_frame(&gl, screen_px));
+        let with_cursor = (!self.captures.is_empty()
+            || self.screen_capture.wants(true, |id| alone.contains(&id)))
+        .then(|| read_frame(&gl, screen_px));
         self.screen_capture.draw_dmabuf(&gl, &blits, true, size.h);
         // Not waited on: offscreen, the copy to the screen reads this frame
         // on the same context after it, and the fence that copy ends with
@@ -3109,6 +3117,7 @@ impl<S: Shell> Host<S> {
             self.lock.drawn();
         }
         drop(framebuffer);
+        let drew_alone = self.draw_windows_alone(&gl, placements, &surfaces, &alone);
         // The GPU may still be reading the client buffers; they stay held
         // until the frame is on screen (see `Kms::in_flight`). Before the
         // copy to the screen, so a frame that then fails to reach it does
@@ -3129,7 +3138,7 @@ impl<S: Shell> Host<S> {
         }
         #[cfg(not(feature = "kms"))]
         drop(cursor_elements);
-        if bare.is_some() || with_cursor.is_some() || !blits.is_empty() {
+        if bare.is_some() || with_cursor.is_some() || !blits.is_empty() || drew_alone {
             self.deliver_captures(bare.as_ref(), with_cursor.as_ref());
         }
         let capture = with_cursor.filter(|_| !self.captures.is_empty());

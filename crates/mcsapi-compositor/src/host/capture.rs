@@ -14,11 +14,13 @@
 //! (XRGB, ARGB, XBGR or ABGR 8888) through a read back from the GPU, or a
 //! dma-buf (XRGB or XBGR 8888, on the GPU's render node) by the GPU itself,
 //! which is what xdg-desktop-portal-wlr hands PipeWire when it can, so a
-//! screen share costs no copy through memory. A window is cut out
-//! of the frame where its content is placed, so whatever covers it (the
-//! chrome's popups) is in the picture too, and a window that is not placed
-//! (minimized, on another workspace) waits until it is. Damage is not
-//! tracked: every frame counts as changed.
+//! screen share costs no copy through memory. A Wayland client's window is
+//! drawn on its own, its surfaces alone into a picture of its size, so
+//! nothing that covers it on screen is shared with it, and without the
+//! pointer. An in-process app's window is cut out of the frame where its
+//! content is placed, whatever covers it included. A window that is not
+//! placed (minimized, on another workspace) waits until it is. Damage is
+//! not tracked: every frame counts as changed.
 
 use std::{
     sync::{
@@ -31,7 +33,11 @@ use std::{
 use smithay::{
     backend::{
         allocator::{Buffer as _, Fourcc, Modifier, format::FormatSet},
-        renderer::{ImportDma as _, gles::GlesTexture},
+        renderer::{
+            Bind as _, Color32F, Frame as _, ImportDma as _, Offscreen, Renderer as _,
+            element::{Element as _, RenderElement as _, surface::WaylandSurfaceRenderElement},
+            gles::{GlesRenderer, GlesTexture},
+        },
     },
     reexports::{
         wayland_protocols::ext::{
@@ -66,13 +72,15 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_output::Transform, wl_shm::Format},
         },
     },
-    utils::{Clock, Logical, Monotonic, Rectangle},
+    utils::{
+        Buffer as BufferCoord, Clock, Logical, Monotonic, Rectangle, Scale, Size, Transform as Turn,
+    },
     wayland::{dmabuf::get_dmabuf, foreign_toplevel_list::ForeignToplevelHandle, shm},
 };
 use tracing::warn;
 
 use super::{Host, security::unsandboxed};
-use crate::{Capture, Shell, WindowId};
+use crate::{Blur, Capture, Placement, Shell, WindowId};
 
 /// The shm formats a capture can be written in.
 const FORMATS: [Format; 4] = [
@@ -134,6 +142,8 @@ struct Request {
     buffer: WlBuffer,
     /// For a dma-buf, how drawing into it went this frame.
     drawn: Drawn,
+    /// For a window drawn on its own into shared memory, its picture.
+    alone: Option<Capture>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,10 +189,81 @@ impl Captures {
 
     /// Whether a capture waits for a frame drawn with (or without) the
     /// pointer.
-    pub(super) fn wants(&self, cursor: bool) -> bool {
+    /// Whether a capture into shared memory waits for the frame, read
+    /// back before the pointer is drawn or after it. A window `alone`
+    /// says is drawn on its own needs nothing of the frame.
+    pub(super) fn wants(&self, cursor: bool, alone: impl Fn(WindowId) -> bool) -> bool {
+        self.pending.iter().any(|r| {
+            r.cursor == cursor
+                && get_dmabuf(&r.buffer).is_err()
+                && !matches!(r.source, Source::Window(id) if alone(id))
+        })
+    }
+
+    /// The captures of windows `alone` says are drawn on their own: each
+    /// request's index and its window.
+    pub(super) fn windows_alone(&self, alone: impl Fn(WindowId) -> bool) -> Vec<(usize, WindowId)> {
         self.pending
             .iter()
-            .any(|r| r.cursor == cursor && get_dmabuf(&r.buffer).is_err())
+            .enumerate()
+            .filter_map(|(i, r)| match r.source {
+                Source::Window(id) if alone(id) => Some((i, id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Draws `elements`, a window's surfaces where they are on screen,
+    /// alone into capture `request`'s buffer, `rect` being where the window
+    /// is. A dma-buf is drawn into directly; shared memory gets a picture
+    /// read back from a texture of the window's size, written when the
+    /// frame is delivered.
+    pub(super) fn draw_alone(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        gl: &glow::Context,
+        request: usize,
+        rect: Rectangle<i32, Logical>,
+        elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+    ) {
+        let pending = &mut self.pending[request];
+        let size = (rect.size.w, rect.size.h);
+        if !fits(&pending.buffer, size) || rect.is_empty() {
+            // Failed for its constraints when delivered.
+            return;
+        }
+        let result = match get_dmabuf(&pending.buffer).cloned() {
+            // A dma-buf's first row is the picture's top, as a screen's is.
+            Ok(mut dmabuf) => {
+                draw_window(renderer, &mut dmabuf, rect, elements, Turn::Normal, |_| ())
+            }
+            Err(_) => Offscreen::<GlesTexture>::create_buffer(
+                renderer,
+                Fourcc::Abgr8888,
+                Size::<i32, BufferCoord>::from(size),
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|mut texture| {
+                // Drawn as the frame is, so the read back turns it the
+                // same way.
+                draw_window(
+                    renderer,
+                    &mut texture,
+                    rect,
+                    elements,
+                    Turn::Flipped180,
+                    |_| super::read_frame(gl, [size.0 as u32, size.1 as u32]),
+                )
+            })
+            .map(|picture| pending.alone = Some(picture)),
+        };
+        pending.drawn = match result {
+            Ok(()) => Drawn::Done,
+            Err(e) => {
+                warn!(error = %e, "cannot draw a window on its own for a capture");
+                Drawn::Failed
+            }
+        };
     }
 
     /// Draws the frame so far into the dma-buf captures that want it
@@ -238,6 +319,55 @@ impl Captures {
     fn dmabuf_targets(&self) -> Option<&DmabufTargets> {
         self.dmabuf.as_ref().and_then(Option::as_ref)
     }
+}
+
+/// Draws a window's `elements` into `target`, of `rect`'s size, moved so
+/// `rect`'s corner is the target's and turned by `turn`, then hands `read`
+/// the finished target while it is still bound.
+fn draw_window<T, R>(
+    renderer: &mut GlesRenderer,
+    target: &mut T,
+    rect: Rectangle<i32, Logical>,
+    elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+    turn: Turn,
+    read: impl FnOnce(&mut GlesRenderer) -> R,
+) -> Result<R, String>
+where
+    GlesRenderer: smithay::backend::renderer::Bind<T>,
+{
+    let scale = Scale::from(1.0);
+    let size = rect.size.to_physical(1);
+    let origin = rect.loc.to_physical(1);
+    let full = Rectangle::from_size(size);
+    let mut framebuffer = renderer.bind(target).map_err(|e| e.to_string())?;
+    {
+        let mut frame = renderer
+            .render(&mut framebuffer, size, turn)
+            .map_err(|e| e.to_string())?;
+        frame
+            .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full])
+            .map_err(|e| e.to_string())?;
+        for element in elements.iter().rev() {
+            let mut dst = element.geometry(scale);
+            dst.loc -= origin;
+            let Some(visible) = dst.intersection(full) else {
+                continue;
+            };
+            // Damage is relative to `dst`.
+            let damage = Rectangle::new(visible.loc - dst.loc, visible.size);
+            element
+                .draw(&mut frame, element.src(), dst, &[damage], &[])
+                .map_err(|e| e.to_string())?;
+        }
+        // Waited on: the client reads a dma-buf as soon as it is told the
+        // frame is ready.
+        let sync = frame.finish().map_err(|e| e.to_string())?;
+        if sync.wait().is_err() {
+            return Err("interrupted waiting for the drawing to finish".into());
+        }
+    }
+    drop(framebuffer);
+    Ok(read(renderer))
 }
 
 /// Whether `buffer` is a dma-buf of `size` in a format captures draw into.
@@ -421,6 +551,56 @@ impl<S: Shell + 'static> Host<S> {
         self.screen_capture.sessions = alive;
     }
 
+    /// Whether a capture of window `id` draws it on its own: a Wayland
+    /// client's, whose surfaces can be drawn without the rest.
+    pub(super) fn drawn_alone(&self, id: WindowId) -> bool {
+        matches!(self.windows.get(&id), Some(super::Content::Wayland(_)))
+    }
+
+    /// Draws each capture of a window in `alone` on its own, after the
+    /// frame: its `surfaces` (as the frame drew them, one entry per
+    /// placement) into the capture's buffer. Whether there were any.
+    pub(super) fn draw_windows_alone(
+        &mut self,
+        gl: &glow::Context,
+        placements: &[Placement],
+        surfaces: &[(Vec<Blur>, Vec<WaylandSurfaceRenderElement<GlesRenderer>>)],
+        alone: &[WindowId],
+    ) -> bool {
+        let requests = self.screen_capture.windows_alone(|id| alone.contains(&id));
+        let mut drew = false;
+        for &(request, window) in &requests {
+            // Not drawn this frame until it is, whatever it was last.
+            self.screen_capture.pending[request].drawn = Drawn::Not;
+            self.screen_capture.pending[request].alone = None;
+            if self.lock.locked {
+                continue;
+            }
+            let Some((p, (_, elements))) = placements
+                .iter()
+                .zip(surfaces)
+                .find(|(p, _)| p.window == window)
+            else {
+                continue;
+            };
+            let rect = Rectangle::new(p.client.loc, p.client.size);
+            let renderer = self.backend.renderer();
+            self.screen_capture
+                .draw_alone(renderer, gl, request, rect, elements);
+            drew = true;
+        }
+        // Drawing elsewhere took a window's own surface off the context;
+        // it is made current again for the swap that follows.
+        if drew
+            && !self.backend.offscreen()
+            && let super::Backend::Winit(backend) = &mut self.backend
+            && let Err(e) = backend.bind()
+        {
+            warn!(error = %e, "cannot draw to the window again after a capture");
+        }
+        !requests.is_empty()
+    }
+
     /// The dma-buf captures this frame draws, each client buffer made a
     /// texture before the frame starts; one that cannot be is failed when
     /// the frame is delivered.
@@ -431,6 +611,7 @@ impl<S: Shell + 'static> Host<S> {
             .iter()
             .enumerate()
             .filter(|(_, r)| get_dmabuf(&r.buffer).is_ok())
+            .filter(|(_, r)| !matches!(r.source, Source::Window(id) if self.drawn_alone(id)))
             .filter_map(|(i, r)| {
                 let rect = self.capture_rect(r.source)?;
                 Some((i, r.cursor, r.region.unwrap_or(rect)))
@@ -489,7 +670,14 @@ impl<S: Shell + 'static> Host<S> {
                 fail(&request.target, FailureReason::BufferConstraints);
                 continue;
             }
-            if get_dmabuf(&request.buffer).is_ok() {
+            if let Some(alone) = &request.alone {
+                if !write(&request.buffer, alone, Rectangle::from_size(rect.size)) {
+                    fail(&request.target, FailureReason::Unknown);
+                    continue;
+                }
+            } else if get_dmabuf(&request.buffer).is_ok()
+                || matches!(request.source, Source::Window(id) if self.drawn_alone(id))
+            {
                 match request.drawn {
                     Drawn::Done => {}
                     Drawn::Failed => {
@@ -838,6 +1026,7 @@ impl<S: Shell + 'static> Dispatch<ExtImageCopyCaptureFrameV1, ExtFrameData> for 
                     cursor: session.cursor,
                     buffer,
                     drawn: Drawn::Not,
+                    alone: None,
                 });
             }
             _ => {}
@@ -970,6 +1159,7 @@ impl<S: Shell + 'static> Dispatch<ZwlrScreencopyFrameV1, WlrFrameData> for Host<
             cursor: data.cursor,
             buffer,
             drawn: Drawn::Not,
+            alone: None,
         });
     }
 
