@@ -9,9 +9,12 @@
 //!   grim.
 //! - `zwlr_screencopy_manager_v1`: grim, wf-recorder, wayvnc.
 //!
-//! A capture is copied into the client's `wl_shm` buffer (XRGB, ARGB, XBGR
-//! or ABGR 8888) from the next frame drawn, with or without the pointer as
-//! the client asked; there are no dmabuf captures yet. A window is cut out
+//! A capture is copied from the next frame drawn, with or without the
+//! pointer as the client asked, into the client's buffer: a `wl_shm` one
+//! (XRGB, ARGB, XBGR or ABGR 8888) through a read back from the GPU, or a
+//! dma-buf (XRGB or XBGR 8888, on the GPU's render node) by the GPU itself,
+//! which is what xdg-desktop-portal-wlr hands PipeWire when it can, so a
+//! screen share costs no copy through memory. A window is cut out
 //! of the frame where its content is placed, so whatever covers it (the
 //! chrome's popups) is in the picture too, and a window that is not placed
 //! (minimized, on another workspace) waits until it is. Damage is not
@@ -26,6 +29,10 @@ use std::{
 };
 
 use smithay::{
+    backend::{
+        allocator::{Buffer as _, Fourcc, Modifier, format::FormatSet},
+        renderer::{ImportDma as _, gles::GlesTexture},
+    },
     reexports::{
         wayland_protocols::ext::{
             foreign_toplevel_list::v1::server::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
@@ -60,7 +67,7 @@ use smithay::{
         },
     },
     utils::{Clock, Logical, Monotonic, Rectangle},
-    wayland::{foreign_toplevel_list::ForeignToplevelHandle, shm},
+    wayland::{dmabuf::get_dmabuf, foreign_toplevel_list::ForeignToplevelHandle, shm},
 };
 use tracing::warn;
 
@@ -74,6 +81,10 @@ const FORMATS: [Format; 4] = [
     Format::Xbgr8888,
     Format::Abgr8888,
 ];
+
+/// The dma-buf formats a capture can be drawn into. The frame's alpha
+/// means nothing, so only formats without one are offered.
+const DMABUF_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb8888, Fourcc::Xbgr8888];
 
 /// What a capture shows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,12 +132,40 @@ struct Request {
     region: Option<Rectangle<i32, Logical>>,
     cursor: bool,
     buffer: WlBuffer,
+    /// For a dma-buf, how drawing into it went this frame.
+    drawn: Drawn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Drawn {
+    Not,
+    Done,
+    /// The renderer could not draw into it.
+    Failed,
+}
+
+/// Where dma-buf captures go: the device clients allocate them on, and the
+/// formats, with their modifiers, the renderer can draw into.
+pub(super) struct DmabufTargets {
+    device: u64,
+    formats: Vec<(Fourcc, Vec<Modifier>)>,
+}
+
+/// A dma-buf capture to draw this frame: its request, where in the frame,
+/// and the client's buffer as a texture the frame can draw into.
+pub(super) struct Blit {
+    request: usize,
+    cursor: bool,
+    rect: Rectangle<i32, Logical>,
+    texture: GlesTexture,
 }
 
 #[derive(Default)]
 pub(super) struct Captures {
     pending: Vec<Request>,
     sessions: Vec<ExtImageCopyCaptureSessionV1>,
+    /// `None` until the renderer has been asked, then whatever it said.
+    dmabuf: Option<Option<DmabufTargets>>,
 }
 
 impl Captures {
@@ -141,12 +180,136 @@ impl Captures {
     /// Whether a capture waits for a frame drawn with (or without) the
     /// pointer.
     pub(super) fn wants(&self, cursor: bool) -> bool {
-        self.pending.iter().any(|r| r.cursor == cursor)
+        self.pending
+            .iter()
+            .any(|r| r.cursor == cursor && get_dmabuf(&r.buffer).is_err())
+    }
+
+    /// Draws the frame so far into the dma-buf captures that want it
+    /// (`cursor` or not), once the frame has what they show.
+    pub(super) fn draw_dmabuf(
+        &mut self,
+        gl: &glow::Context,
+        blits: &[Blit],
+        cursor: bool,
+        frame_height: i32,
+    ) {
+        let mut drew = false;
+        for b in blits.iter().filter(|b| b.cursor == cursor) {
+            // SAFETY: called from draw(), with the frame current and bound.
+            let ok = unsafe { blit(gl, b, frame_height) };
+            self.pending[b.request].drawn = if ok { Drawn::Done } else { Drawn::Failed };
+            drew |= ok;
+        }
+        if drew {
+            use glow::HasContext as _;
+            // The client reads its buffer as soon as it is told it is
+            // ready, without a fence to wait on.
+            // SAFETY: as above.
+            unsafe { gl.finish() };
+        }
+    }
+
+    /// Whether the renderer still has to say where dma-buf captures go.
+    pub(super) fn dmabuf_unknown(&self) -> bool {
+        self.dmabuf.is_none()
+    }
+
+    /// What the renderer said: the client device and the formats it can
+    /// draw into, of which those in [`DMABUF_FORMATS`] are offered.
+    pub(super) fn set_dmabuf(&mut self, device: Option<u64>, renderable: &FormatSet) {
+        self.dmabuf = Some(device.and_then(|device| {
+            let formats: Vec<(Fourcc, Vec<Modifier>)> = DMABUF_FORMATS
+                .into_iter()
+                .map(|code| {
+                    let modifiers = renderable
+                        .iter()
+                        .filter(|f| f.code == code)
+                        .map(|f| f.modifier)
+                        .collect::<Vec<_>>();
+                    (code, modifiers)
+                })
+                .filter(|(_, modifiers)| !modifiers.is_empty())
+                .collect();
+            (!formats.is_empty()).then_some(DmabufTargets { device, formats })
+        }));
+    }
+
+    fn dmabuf_targets(&self) -> Option<&DmabufTargets> {
+        self.dmabuf.as_ref().and_then(Option::as_ref)
     }
 }
 
-/// The buffer's layout, if it is shm in a format we write and fits `size`.
+/// Whether `buffer` is a dma-buf of `size` in a format captures draw into.
+fn dmabuf_fits(buffer: &WlBuffer, (w, h): (i32, i32)) -> Option<bool> {
+    let dmabuf = get_dmabuf(buffer).ok()?;
+    let size = dmabuf.size();
+    Some(size.w == w && size.h == h && DMABUF_FORMATS.contains(&dmabuf.format().code))
+}
+
+/// Copies `rect` of the frame being drawn into `blit`'s texture, top row
+/// first as a dma-buf's rows run, where GL's run from the bottom.
+///
+/// # Safety
+///
+/// The frame's context must be current, with the frame bound.
+pub(super) unsafe fn blit(gl: &glow::Context, blit: &Blit, frame_height: i32) -> bool {
+    use glow::HasContext as _;
+    let Some(id) = std::num::NonZeroU32::new(blit.texture.tex_id()) else {
+        return false;
+    };
+    let r = blit.rect;
+    // SAFETY: the caller's context is current; everything bound or
+    // enabled here is put back before returning.
+    unsafe {
+        let frame = gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING);
+        let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+        let Ok(fbo) = gl.create_framebuffer() else {
+            return false;
+        };
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::DRAW_FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(glow::NativeTexture(id)),
+            0,
+        );
+        let complete =
+            gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+        if complete {
+            // A scissor the frame left set would cut the copy short.
+            gl.disable(glow::SCISSOR_TEST);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, frame);
+            let bottom = frame_height - r.loc.y - r.size.h;
+            gl.blit_framebuffer(
+                r.loc.x,
+                bottom,
+                r.loc.x + r.size.w,
+                bottom + r.size.h,
+                0,
+                r.size.h,
+                r.size.w,
+                0,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+            if scissor {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+        }
+        gl.bind_framebuffer(glow::FRAMEBUFFER, frame);
+        gl.delete_framebuffer(fbo);
+        complete
+    }
+}
+
+/// Whether the buffer is one a capture of `size` can go into: shm in a
+/// format we write, or a dma-buf in one we draw into.
 fn fits(buffer: &WlBuffer, size: (i32, i32)) -> bool {
+    if let Some(fits) = dmabuf_fits(buffer, size) {
+        return fits;
+    }
     shm::with_buffer_contents(buffer, |_, len, data| {
         data.width == size.0
             && data.height == size.1
@@ -249,7 +412,7 @@ impl<S: Shell + 'static> Host<S> {
                     let mut last = data.size.lock().unwrap_or_else(|e| e.into_inner());
                     if *last != Some(size) {
                         *last = Some(size);
-                        send_constraints(&session, size);
+                        send_constraints(&session, size, self.screen_capture.dmabuf_targets());
                     }
                 }
             }
@@ -258,8 +421,46 @@ impl<S: Shell + 'static> Host<S> {
         self.screen_capture.sessions = alive;
     }
 
+    /// The dma-buf captures this frame draws, each client buffer made a
+    /// texture before the frame starts; one that cannot be is failed when
+    /// the frame is delivered.
+    pub(super) fn dmabuf_blits(&mut self) -> Vec<Blit> {
+        let wanted: Vec<(usize, bool, Rectangle<i32, Logical>)> = self
+            .screen_capture
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| get_dmabuf(&r.buffer).is_ok())
+            .filter_map(|(i, r)| {
+                let rect = self.capture_rect(r.source)?;
+                Some((i, r.cursor, r.region.unwrap_or(rect)))
+            })
+            .collect();
+        let mut blits = Vec::with_capacity(wanted.len());
+        for (request, cursor, rect) in wanted {
+            let pending = &mut self.screen_capture.pending[request];
+            let Ok(dmabuf) = get_dmabuf(&pending.buffer).cloned() else {
+                continue;
+            };
+            match self.backend.renderer().import_dmabuf(&dmabuf, None) {
+                Ok(texture) => blits.push(Blit {
+                    request,
+                    cursor,
+                    rect,
+                    texture,
+                }),
+                Err(e) => {
+                    warn!(error = %e, "cannot draw a capture into its dma-buf");
+                    pending.drawn = Drawn::Failed;
+                }
+            }
+        }
+        blits
+    }
+
     /// Fills the captures that wait for this frame: `bare` was read before
-    /// the pointer was drawn, `with_cursor` after.
+    /// the pointer was drawn, `with_cursor` after, and dma-bufs were drawn
+    /// into during it.
     pub(super) fn deliver_captures(
         &mut self,
         bare: Option<&Capture>,
@@ -284,17 +485,31 @@ impl<S: Shell + 'static> Host<S> {
                 (Some(region), Some(_)) => region,
                 (None, Some(rect)) => rect,
             };
-            let Some(frame) = frame else {
-                self.screen_capture.pending.push(request);
-                continue;
-            };
             if !fits(&request.buffer, (rect.size.w, rect.size.h)) {
                 fail(&request.target, FailureReason::BufferConstraints);
                 continue;
             }
-            if !write(&request.buffer, frame, rect) {
-                fail(&request.target, FailureReason::Unknown);
-                continue;
+            if get_dmabuf(&request.buffer).is_ok() {
+                match request.drawn {
+                    Drawn::Done => {}
+                    Drawn::Failed => {
+                        fail(&request.target, FailureReason::BufferConstraints);
+                        continue;
+                    }
+                    Drawn::Not => {
+                        self.screen_capture.pending.push(request);
+                        continue;
+                    }
+                }
+            } else {
+                let Some(frame) = frame else {
+                    self.screen_capture.pending.push(request);
+                    continue;
+                };
+                if !write(&request.buffer, frame, rect) {
+                    fail(&request.target, FailureReason::Unknown);
+                    continue;
+                }
             }
             let (w, h) = (rect.size.w, rect.size.h);
             match request.target {
@@ -324,10 +539,24 @@ fn fail(target: &Target, reason: FailureReason) {
 }
 
 /// Sends a session what its buffers must be.
-fn send_constraints(session: &ExtImageCopyCaptureSessionV1, (w, h): (i32, i32)) {
+fn send_constraints(
+    session: &ExtImageCopyCaptureSessionV1,
+    (w, h): (i32, i32),
+    dmabuf: Option<&DmabufTargets>,
+) {
     session.buffer_size(w.max(1) as u32, h.max(1) as u32);
     for format in FORMATS {
         session.shm_format(format);
+    }
+    if let Some(targets) = dmabuf {
+        session.dmabuf_device(targets.device.to_ne_bytes().to_vec());
+        for (code, modifiers) in &targets.formats {
+            let modifiers = modifiers
+                .iter()
+                .flat_map(|m| u64::from(*m).to_ne_bytes())
+                .collect();
+            session.dmabuf_format(*code as u32, modifiers);
+        }
     }
     session.done();
 }
@@ -608,6 +837,7 @@ impl<S: Shell + 'static> Dispatch<ExtImageCopyCaptureFrameV1, ExtFrameData> for 
                     region: None,
                     cursor: session.cursor,
                     buffer,
+                    drawn: Drawn::Not,
                 });
             }
             _ => {}
@@ -690,6 +920,11 @@ impl<S: Shell + 'static> Dispatch<ZwlrScreencopyManagerV1, ()> for Host<S> {
         let (w, h) = (region.size.w as u32, region.size.h as u32);
         frame.buffer(Format::Xrgb8888, w, h, w * 4);
         if frame.version() >= 3 {
+            if let Some(targets) = host.screen_capture.dmabuf_targets() {
+                for (code, _) in &targets.formats {
+                    frame.linux_dmabuf(*code as u32, w, h);
+                }
+            }
             frame.buffer_done();
         }
     }
@@ -734,6 +969,7 @@ impl<S: Shell + 'static> Dispatch<ZwlrScreencopyFrameV1, WlrFrameData> for Host<
             region: Some(data.region),
             cursor: data.cursor,
             buffer,
+            drawn: Drawn::Not,
         });
     }
 
