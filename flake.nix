@@ -176,14 +176,18 @@
 
           devShells.default = craneLib.devShell {
             inherit (commonArgs) LD_LIBRARY_PATH;
-            # nixpkgs' rustc has no llvm-tools component; cargo-llvm-cov uses
-            # the LLVM rustc was built with instead.
+            # nixpkgs' rustc has no llvm-tools component, so a cargo-llvm-cov
+            # of one's own uses the LLVM rustc was built with instead.
             LLVM_COV = "${pkgs.rustc.llvmPackages.llvm}/bin/llvm-cov";
             LLVM_PROFDATA = "${pkgs.rustc.llvmPackages.llvm}/bin/llvm-profdata";
             inputsFrom = [ deps.gpui ];
             packages = with pkgs; [
               rust-analyzer
-              cargo-llvm-cov
+              # No cargo-llvm-cov: with nixpkgs' rustc 1.99, a test binary
+              # built with -C instrument-coverage crashes (SIGSEGV) as it
+              # writes its profile, so the package fails its own tests and
+              # took this shell down with it. The Coverage job in CI measures
+              # with rustup's toolchain instead.
               cargo-audit
               bacon
               # bindings/node
