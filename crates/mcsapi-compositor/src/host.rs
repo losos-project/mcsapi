@@ -4,22 +4,19 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
-    fs::File,
     io,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command as Process},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 mod automation;
 mod capture;
+mod clipboard;
 mod cursor;
 mod effects;
 mod foreign;
@@ -97,10 +94,8 @@ use smithay::{
         output::{OutputHandler, OutputManagerState},
         pointer_gestures::PointerGesturesState,
         selection::{
-            SelectionHandler,
             data_device::{
-                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-                set_data_device_focus, set_data_device_selection,
+                ClientDndGrabHandler, DataDeviceState, ServerDndGrabHandler, set_data_device_focus,
             },
             primary_selection::{
                 PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
@@ -148,104 +143,6 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
-const MAX_SELECTION_TRANSFERS: usize = 4;
-const SELECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-static ACTIVE_SELECTION_TRANSFERS: AtomicUsize = AtomicUsize::new(0);
-
-struct SelectionTransferGuard;
-
-impl SelectionTransferGuard {
-    fn acquire() -> Option<Self> {
-        let mut active = ACTIVE_SELECTION_TRANSFERS.load(Ordering::Relaxed);
-        loop {
-            if active >= MAX_SELECTION_TRANSFERS {
-                return None;
-            }
-            match ACTIVE_SELECTION_TRANSFERS.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(Self),
-                Err(current) => active = current,
-            }
-        }
-    }
-}
-
-impl Drop for SelectionTransferGuard {
-    fn drop(&mut self) {
-        ACTIVE_SELECTION_TRANSFERS.fetch_sub(1, Ordering::Release);
-    }
-}
-
-fn write_selection(fd: OwnedFd, text: &[u8], timeout: Duration) -> io::Result<()> {
-    let file = File::from(fd);
-    let raw_fd = file.as_raw_fd();
-    // SAFETY: fcntl is called with a valid owned file descriptor.
-    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fcntl is called with a valid owned file descriptor and its existing flags.
-    if unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let deadline = Instant::now() + timeout;
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        if Instant::now() >= deadline {
-            return Err(io::Error::from(io::ErrorKind::TimedOut));
-        }
-        // SAFETY: the byte slice is valid for the duration of this write call.
-        let written = unsafe { libc::write(raw_fd, remaining.as_ptr().cast(), remaining.len()) };
-        if written > 0 {
-            remaining = &remaining[written as usize..];
-            continue;
-        }
-        if written == 0 {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
-        }
-
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(error);
-        }
-
-        let remaining_time = deadline.saturating_duration_since(Instant::now());
-        if remaining_time.is_zero() {
-            return Err(io::Error::from(io::ErrorKind::TimedOut));
-        }
-        let timeout_ms = remaining_time.as_millis().clamp(1, i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: raw_fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: descriptor points to one initialized pollfd and the fd remains owned.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if ready == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if ready == 0 {
-            return Err(io::Error::from(io::ErrorKind::TimedOut));
-        }
-        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
-        }
-    }
-    Ok(())
-}
 /// Touchpad scrolling without stop events (nested under winit) ends after
 /// this long without motion.
 const SCROLL_IDLE_MS: u32 = 50;
@@ -377,6 +274,8 @@ pub(crate) struct Host<S: Shell> {
     _pointer_gestures_state: PointerGesturesState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
+    /// The one clipboard every window shares (see `clipboard`).
+    clipboard: clipboard::Clipboard<S>,
     /// `zwp_linux_dmabuf_v1`, whose global exists only on the bare seat.
     #[cfg(feature = "kms")]
     dmabuf_state: DmabufState,
@@ -736,6 +635,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         _output_manager_state: OutputManagerState::new_with_xdg_output::<Host<S>>(&dh),
         _pointer_gestures_state: PointerGesturesState::new::<Host<S>>(&dh),
         data_device_state: DataDeviceState::new::<Host<S>>(&dh),
+        clipboard: clipboard::Clipboard::new(event_loop.handle()),
         #[cfg(feature = "kms")]
         dmabuf_state,
         #[cfg(feature = "kms")]
@@ -919,6 +819,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
     let run_result = event_loop.run(None, &mut host, |host| {
         host.space.refresh();
         host.popups.cleanup();
+        host.clipboard_owner_check();
         let _ = host.display.flush_clients();
     });
     for child in host
@@ -2481,6 +2382,11 @@ impl<S: Shell> Host<S> {
             route => route,
         };
         let mods = self.egui_mods;
+        let paste_target = match route {
+            KeyRoute::Chrome => Some(clipboard::PasteTarget::Chrome),
+            KeyRoute::Client => self.shell.focused().map(clipboard::PasteTarget::Window),
+            KeyRoute::Consume => None,
+        };
         let events = match route {
             KeyRoute::Consume => {
                 if pressed {
@@ -2497,6 +2403,23 @@ impl<S: Shell> Host<S> {
                 }
             }
         };
+        // Copying and pasting are events of their own to egui, as
+        // egui-winit sends them, and replace the key.
+        let clipboard_key = egui_key(sym).and_then(|key| clipboard::ClipboardKey::of(key, mods));
+        if let Some(clipboard_key) = clipboard_key {
+            if pressed {
+                match clipboard_key {
+                    clipboard::ClipboardKey::Copy => events.push(egui::Event::Copy),
+                    clipboard::ClipboardKey::Cut => events.push(egui::Event::Cut),
+                    clipboard::ClipboardKey::Paste => {
+                        if let Some(target) = paste_target {
+                            self.paste_into(target);
+                        }
+                    }
+                }
+            }
+            return FilterResult::Intercept(());
+        }
         if let Some(egui_key) = egui_key(sym) {
             events.push(egui::Event::Key {
                 key: egui_key,
@@ -2631,6 +2554,12 @@ impl<S: Shell> Host<S> {
             mcsapi_ui::paint_focus_ring(root.ctx(), accent);
         });
         self.chrome_access = output.platform_output.accesskit_update.take();
+        // The palette's and the overview's fields copy like an app's.
+        for command in std::mem::take(&mut output.platform_output.commands) {
+            if let egui::OutputCommand::CopyText(text) = command {
+                self.set_clipboard_text(text);
+            }
+        }
         let chrome_cursor = output.platform_output.cursor_icon;
         let chrome = Pass {
             primitives: self
@@ -2776,18 +2705,9 @@ impl<S: Shell> Host<S> {
         clicks.frame(&egui.ctx, time);
         let mut output = mcsapi_ui::run_frame(app, &egui.ctx, input, &theme);
         *access = output.platform_output.accesskit_update.take();
-        for command in output.platform_output.commands {
+        for command in std::mem::take(&mut output.platform_output.commands) {
             if let egui::OutputCommand::CopyText(text) = command {
-                set_data_device_selection(
-                    &self.display,
-                    &self.seat,
-                    vec![
-                        "text/plain;charset=utf-8".into(),
-                        "text/plain".into(),
-                        "UTF8_STRING".into(),
-                    ],
-                    text,
-                );
+                self.clipboard.serve_text(&self.display, &self.seat, text);
             }
         }
         // Fill the whole content area, not only what the app laid out,
@@ -3938,46 +3858,9 @@ impl<S: Shell + 'static> SeatHandler for Host<S> {
         let client = focused.and_then(|s| self.display.get_client(s.id()).ok());
         set_data_device_focus(&self.display, seat, client.clone());
         set_primary_focus(&self.display, seat, client);
+        self.clipboard_focus_changed();
         self.text_inputs.set_focus(focused.cloned());
         self.text_input_changed();
-    }
-}
-
-impl<S: Shell + 'static> SelectionHandler for Host<S> {
-    type SelectionUserData = String;
-
-    fn send_selection(
-        &mut self,
-        _ty: smithay::wayland::selection::SelectionTarget,
-        mime_type: String,
-        fd: OwnedFd,
-        _seat: Seat<Self>,
-        user_data: &Self::SelectionUserData,
-    ) {
-        if matches!(
-            mime_type.as_str(),
-            "text/plain" | "text/plain;charset=utf-8" | "UTF8_STRING"
-        ) {
-            let Some(guard) = SelectionTransferGuard::acquire() else {
-                return;
-            };
-            let text = user_data.clone();
-            if let Err(error) = std::thread::Builder::new()
-                .name("mcsapi-selection-send".into())
-                .spawn(move || {
-                    let _guard = guard;
-                    let _ = write_selection(fd, text.as_bytes(), SELECTION_WRITE_TIMEOUT);
-                })
-            {
-                warn!(%error, "cannot start clipboard transfer");
-            }
-        }
-    }
-}
-
-impl<S: Shell + 'static> DataDeviceHandler for Host<S> {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
     }
 }
 
@@ -3990,7 +3873,6 @@ impl<S: Shell + 'static> PrimarySelectionHandler for Host<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::FromRawFd;
 
     #[test]
     fn egui_repaint_requests_come_due_once() {
@@ -4195,31 +4077,6 @@ mod tests {
             KeyRoute::Consume
         );
         assert_eq!(shell.keys, [true, false]);
-    }
-
-    #[test]
-    fn clipboard_transfers_are_bounded() {
-        let guards: Vec<_> = (0..MAX_SELECTION_TRANSFERS)
-            .map(|_| SelectionTransferGuard::acquire().unwrap())
-            .collect();
-        assert!(SelectionTransferGuard::acquire().is_none());
-        drop(guards);
-        assert!(SelectionTransferGuard::acquire().is_some());
-    }
-
-    #[test]
-    fn stalled_clipboard_write_times_out() {
-        let mut fds = [0; 2];
-        // SAFETY: fds points to two writable integers for pipe to initialize.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        // SAFETY: pipe initialized both descriptors and ownership is transferred exactly once.
-        let _read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        // SAFETY: pipe initialized both descriptors and ownership is transferred exactly once.
-        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-
-        let error =
-            write_selection(write, &vec![0; 1024 * 1024], Duration::from_millis(20)).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }
 
