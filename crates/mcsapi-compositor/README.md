@@ -14,8 +14,10 @@ Windows come from two places, and get the same decorations, tiling and focus:
 
 Wayland protocols are listed under [Protocols](#protocols). The session runs nested in a window of the current X11 or Wayland session
 (Smithay's winit backend, GLES renderer, egui painted with `egui_glow`), or,
-with the `kms` feature, on the bare seat: the first connected display at its
-preferred mode through DRM/KMS and GBM, input from libinput, and the GPU and
+with the `kms` feature, on the bare seat: every connected display at its
+preferred mode through DRM/KMS and GBM, the first one the output and the
+others showing the same frame scaled to fit, displays plugged in or out
+followed as they come and go, input from libinput, and the GPU and
 input devices taken through libseat (logind or seatd) and given back on a VT
 switch (Ctrl+Alt+F1–F12). The bare seat is used when neither `WAYLAND_DISPLAY`
 nor `DISPLAY` is set; `MCSAPI_BACKEND=kms` or `=winit` decides instead. On the
@@ -64,8 +66,8 @@ Capture queued after them sees their result. While one runs,
 `Shell::input_source(true)` tells the shell the input is synthetic, so it
 can refuse to let an agent confirm what only a person should.
 
-Not yet: more than one display on the bare seat, hotplug, direct scanout of
-client buffers, XWayland, popup grabs, linux-dmabuf.
+Not yet: displays that extend the desktop rather than mirror it, direct
+scanout of client buffers, XWayland, popup grabs, linux-dmabuf.
 
 ## Protocols
 
@@ -150,10 +152,11 @@ hidden window's FIFO barriers still clear every frame.
 
 The display: `zwlr_output_manager_v1` (wlr-randr, kanshi) lists the output;
 a configuration that keeps it as it is succeeds and any other fails, since
-there is one display at one mode. `zwlr_output_power_manager_v1` (wlopm,
+there is one output at one mode, which every display mirrors. `zwlr_output_power_manager_v1` (wlopm,
 swayidle) turns it off, with DPMS on the bare seat, and nothing is drawn
 until it is back on. `zwlr_gamma_control_manager_v1` (gammastep, wlsunset)
-sets the bare seat's gamma ramp for one client at a time; nested it fails.
+sets the bare seat's gamma ramp, on every display, for one client at a
+time; nested it fails.
 
 Screen capture: `ext_image_copy_capture_manager_v1` with output and window
 sources (`ext_output_image_capture_source_manager_v1`,
