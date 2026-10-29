@@ -514,6 +514,11 @@ impl Kms {
         Ok(())
     }
 
+    /// The node clients allocate buffers on.
+    pub(crate) fn render_node(&self) -> DrmNode {
+        self.node
+    }
+
     /// The `zwp_linux_dmabuf_v1` feedback for every surface: the buffers
     /// this renderer can sample from, allocated on the GPU's render node.
     /// Every client surface is composited into the offscreen frame, none

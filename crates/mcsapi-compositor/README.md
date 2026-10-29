@@ -166,9 +166,11 @@ Screen capture: `ext_image_copy_capture_manager_v1` with output and window
 sources (`ext_output_image_capture_source_manager_v1`,
 `ext_foreign_toplevel_image_capture_source_manager_v1`), and
 `zwlr_screencopy_manager_v1` (grim, wf-recorder, wayvnc,
-xdg-desktop-portal-wlr). Captures go into `wl_shm` buffers from the next
-frame, with or without the pointer; a window is cut out of the frame where
-its content is placed.
+xdg-desktop-portal-wlr). Captures go into `wl_shm` buffers, or dma-bufs on
+the bare seat, from the next frame, with or without the pointer. A Wayland
+client's window is drawn on its own, so nothing covering it on screen is in
+the picture, and neither is the pointer; an in-process app's window is cut
+out of the frame where its content is placed.
 
 Screen lockers: `ext_session_lock_v1` (swaylock, hyprlock). While locked,
 only the locker's surface is shown and every key and pointer event goes to
