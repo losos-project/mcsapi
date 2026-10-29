@@ -39,8 +39,32 @@ env:
   HARDENED_MALLOC_COMMIT: 3bee8d3e0e4fd82b684521891373f40ab4982a5a
 
 jobs:
+  # Whether the change can affect the code (.github/changes): one that only
+  # edits text, editor settings or another workflow skips the jobs below, and
+  # the security audit runs on a pull request only when the dependencies
+  # changed, since an advisory published meanwhile is no fault of the pull
+  # request's and main and the weekly run audit anyway. `CI success` accepts
+  # the skips; if this job fails, it fails too.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+      deps: ${{ steps.changes.outputs.deps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: .github/changes .github/workflows/ci.yml >> "$GITHUB_OUTPUT"
+
   fmt:
     name: Format
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -52,6 +76,8 @@ jobs:
 
   clippy:
     name: Clippy (${{ matrix.features }})
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -82,6 +108,8 @@ jobs:
   # core apps for wasm32), so it has to keep building without Smithay.
   wasm:
     name: Toolkit on wasm32
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,6 +127,8 @@ jobs:
 
   test:
     name: Test (${{ matrix.toolchain }}, ${{ matrix.features }})
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -163,6 +193,8 @@ jobs:
 
   docs:
     name: Docs
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
@@ -180,6 +212,8 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -223,6 +257,8 @@ jobs:
 
   audit:
     name: Security audit
+    needs: [changes]
+    if: needs.changes.outputs.deps == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -235,6 +271,8 @@ jobs:
 
   nix:
     name: Nix flake
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -249,7 +287,7 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, clippy, wasm, test, docs, coverage, audit, nix]
+    needs: [changes, fmt, clippy, wasm, test, docs, coverage, audit, nix]
     runs-on: ubuntu-latest
     steps:
       - name: Check required jobs
