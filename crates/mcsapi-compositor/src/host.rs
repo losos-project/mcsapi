@@ -745,7 +745,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
     }
     #[cfg(feature = "kms")]
     if let Some(sources) = kms_sources {
-        use smithay::backend::{drm::DrmEvent, session::Event as SessionEvent};
+        use smithay::backend::{drm::DrmEvent, session::Event as SessionEvent, udev::UdevEvent};
         let handle = event_loop.handle();
         handle.insert_source(sources.input, |event, _, host| {
             host.input(event);
@@ -765,8 +765,20 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
             if let Backend::Kms(k) = &mut host.backend {
                 match event {
                     SessionEvent::PauseSession => k.pause(),
-                    SessionEvent::ActivateSession => k.resume(),
+                    SessionEvent::ActivateSession => {
+                        k.resume();
+                        host.follow_displays();
+                    }
                 }
+            }
+        })?;
+        // A display plugged in or out shows up as a change of its GPU.
+        handle.insert_source(sources.udev, |event, _, host| {
+            if let UdevEvent::Changed { .. } = event
+                && let Backend::Kms(k) = &mut host.backend
+            {
+                k.rescan();
+                host.follow_displays();
             }
         })?;
     }
@@ -1282,20 +1294,43 @@ impl<S: Shell> Host<S> {
         }
     }
 
+    /// The output is now `size`: the window was resized, or on the bare
+    /// seat another display became the output.
+    fn resize_output(&mut self, size: Size<i32, Physical>) {
+        let mode = OutputMode {
+            size,
+            refresh: self.refresh_mhz as i32,
+        };
+        self.output
+            .change_current_state(Some(mode), None, None, None);
+        self.output.set_preferred(mode);
+        self.shell.set_output((size.w, size.h));
+    }
+
+    /// Follows the display that is the output on the bare seat, after a
+    /// display was plugged in or out: its size and refresh rate.
+    #[cfg(feature = "kms")]
+    fn follow_displays(&mut self) {
+        self.dirty = true;
+        let Backend::Kms(k) = &self.backend else {
+            return;
+        };
+        let (size, refresh) = (k.size(), k.refresh_mhz());
+        self.refresh_mhz = refresh;
+        if self
+            .output
+            .current_mode()
+            .is_none_or(|m| m.size != size || m.refresh != refresh as i32)
+        {
+            self.resize_output(size);
+        }
+    }
+
     fn winit_event(&mut self, event: WinitEvent) {
         // A resize, input, or the window shown again after being covered.
         self.dirty = true;
         match event {
-            WinitEvent::Resized { size, .. } => {
-                let mode = OutputMode {
-                    size,
-                    refresh: self.refresh_mhz as i32,
-                };
-                self.output
-                    .change_current_state(Some(mode), None, None, None);
-                self.output.set_preferred(mode);
-                self.shell.set_output((size.w, size.h));
-            }
+            WinitEvent::Resized { size, .. } => self.resize_output(size),
             WinitEvent::Input(event) => self.input(event),
             WinitEvent::CloseRequested => self.signal.stop(),
             #[cfg(feature = "atspi")]
@@ -3112,32 +3147,9 @@ impl<S: Shell> Host<S> {
                 drop(framebuffer);
                 backend.submit(Some(&[full]))?;
             }
+            // To every display (see `kms.rs`).
             #[cfg(feature = "kms")]
-            Backend::Kms(k) => {
-                let (mut dmabuf, _age) = k.surface.next_buffer()?;
-                let mut framebuffer = k.renderer.bind(&mut dmabuf)?;
-                let mut frame = k
-                    .renderer
-                    .render(&mut framebuffer, size, Transform::Normal)?;
-                Frame::render_texture_from_to(
-                    &mut frame,
-                    scene,
-                    src,
-                    full,
-                    &[full],
-                    &[],
-                    OFFSCREEN_COPY,
-                    1.0,
-                )?;
-                let sync = frame.finish()?;
-                drop(framebuffer);
-                // The fence goes with the buffer: the flip waits on it in
-                // the kernel (`IN_FENCE_FD`), or Smithay waits on it here
-                // where the plane takes no fence. Nothing relies on the
-                // driver ordering the flip after the drawing by itself.
-                k.surface.queue_buffer(Some(sync), Some(vec![full]), ())?;
-                k.queued(self.timing.pending.take());
-            }
+            Backend::Kms(k) => k.present(scene, OFFSCREEN_COPY, self.timing.pending.take())?,
         }
         Ok(())
     }
