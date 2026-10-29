@@ -91,7 +91,11 @@ Window hints, passed to `Shell::window_hint`: parents from
 that had the keyboard asked for, or the one a launch puts in
 `XDG_ACTIVATION_TOKEN`, so windows cannot steal focus.
 
-Input and clipboard: `wl_data_device_manager` (clipboard and drag and drop),
+Input and clipboard: `wl_data_device_manager` (clipboard and drag and drop;
+the compositor keeps a copy of each selection's text, HTML, file lists and
+one picture, and serves it once the client that copied it has gone, and
+in-process apps and the chrome copy and paste with Ctrl+C, Ctrl+X and
+Ctrl+V like any client),
 `zwp_primary_selection_device_manager_v1` (middle-click paste),
 `zwp_pointer_gestures_v1`, `zwp_text_input_manager_v3` (see
 `Shell::text_input`), `zwp_relative_pointer_manager_v1` and
