@@ -103,6 +103,14 @@ impl<S: Shell> Shell for Hot<S> {
         hot!(S::window_sandbox, &mut self.0, window, sandbox)
     }
 
+    fn window_process(&mut self, window: WindowId, pid: u32) {
+        hot!(S::window_process, &mut self.0, window, pid)
+    }
+
+    fn window_responding(&mut self, window: WindowId, responding: bool) {
+        hot!(S::window_responding, &mut self.0, window, responding)
+    }
+
     fn focus(&mut self, window: WindowId) {
         hot!(S::focus, &mut self.0, window)
     }

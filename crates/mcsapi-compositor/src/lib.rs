@@ -656,6 +656,20 @@ pub trait Shell: 'static {
     /// that never gets this call came from outside any sandbox.
     fn window_sandbox(&mut self, _window: WindowId, _sandbox: &Sandbox) {}
 
+    /// The process that made the window that was just mapped, from its
+    /// Wayland connection's peer credentials. Called right after
+    /// [`Shell::map_window`] (and [`Shell::window_sandbox`]). For a client
+    /// behind a proxy, such as waypipe or a sandbox's, it is the proxy.
+    fn window_process(&mut self, _window: WindowId, _pid: u32) {}
+
+    /// A window stopped answering the compositor's pings (`responding` is
+    /// false), or answered again. It is pinged when it is clicked or typed
+    /// into, and is told about once its client has gone five seconds
+    /// without a pong: it is stuck outside its event loop, and drawing it
+    /// again will not happen until it gets back. Every window of the same
+    /// client changes together.
+    fn window_responding(&mut self, _window: WindowId, _responding: bool) {}
+
     /// Focus a window (secondary clicks on window content).
     fn focus(&mut self, _window: WindowId) {}
 

@@ -26,6 +26,7 @@ mod input_method;
 mod layer_shell;
 mod lock;
 mod output_config;
+mod responding;
 mod security;
 mod timing;
 #[cfg(feature = "kms")]
@@ -102,8 +103,8 @@ use smithay::{
             },
         },
         shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
+            PopupSurface, PositionerState, ShellClient, ToplevelSurface, XdgShellHandler,
+            XdgShellState, XdgToplevelSurfaceData,
             decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{ShmHandler, ShmState},
@@ -304,6 +305,7 @@ pub(crate) struct Host<S: Shell> {
     timing: timing::Timing,
     output_config: output_config::OutputConfig,
     security: security::Security<S>,
+    responding: responding::Responding,
     text_inputs: TextInputs,
     popups: PopupManager,
     seat: Seat<Self>,
@@ -672,6 +674,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         timing: timing::Timing::new::<S>(&dh),
         output_config: output_config::OutputConfig::new::<S>(&dh),
         security: security::Security::new(&dh, event_loop.handle()),
+        responding: responding::Responding::default(),
         text_inputs: {
             TextInputs::global::<S>(&dh);
             TextInputs::default()
@@ -818,6 +821,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         Timer::from_duration(Duration::from_secs(1)),
         |_, _, host| {
             host.reap_children();
+            host.check_responding();
             TimeoutAction::ToDuration(Duration::from_secs(1))
         },
     )?;
@@ -1422,6 +1426,10 @@ impl<S: Shell> Host<S> {
                         host.filter_key(modifiers, &handle, pressed, keycode, Some(time))
                     },
                 );
+                // Typing into a window is waiting on it, as a click is.
+                if pressed {
+                    self.ping(self.keyboard_focus);
+                }
             }
             // Nested, motion only comes as positions; the step between two
             // is the relative motion games and constraints work with.
@@ -1881,6 +1889,9 @@ impl<S: Shell> Host<S> {
             time,
             |host, modifiers, handle| host.filter_key(modifiers, &handle, pressed, raw, None),
         );
+        if pressed {
+            self.ping(self.keyboard_focus);
+        }
     }
 
     /// Types a character the keymap lacks into the egui context that would
@@ -2291,6 +2302,9 @@ impl<S: Shell> Host<S> {
                 } else {
                     self.content_under()
                 };
+                if pressed {
+                    self.ping(under);
+                }
                 if let Some(Content::Internal { events, clicks, .. }) =
                     under.and_then(|w| self.windows.get_mut(&w))
                 {
@@ -3223,6 +3237,16 @@ impl<S: Shell> Host<S> {
         if let Some(sandbox) = sandbox_of(surface) {
             self.shell.window_sandbox(id, &sandbox);
         }
+        // From the socket's peer credentials, which the client can't make
+        // up: what a report on a hung window reads, and what force quitting
+        // it signals.
+        if let Some(pid) = surface
+            .client()
+            .and_then(|c| c.get_credentials(&self.display).ok())
+            .and_then(|c| u32::try_from(c.pid).ok())
+        {
+            self.shell.window_process(id, pid);
+        }
         self.windows.insert(id, Content::Wayland(window));
         self.window_mapped(id, &toplevel);
         self.sync();
@@ -3648,6 +3672,10 @@ impl<S: Shell + 'static> XdgShellHandler for Host<S> {
             state.decoration_mode = Some(DecorationMode::ServerSide);
         });
         self.unmanaged.push(Window::new_wayland_window(surface));
+    }
+
+    fn client_pong(&mut self, client: ShellClient) {
+        self.ponged(&client);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
