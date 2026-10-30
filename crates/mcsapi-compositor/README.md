@@ -14,8 +14,10 @@ Windows come from two places, and get the same decorations, tiling and focus:
 
 Wayland protocols are listed under [Protocols](#protocols). The session runs nested in a window of the current X11 or Wayland session
 (Smithay's winit backend, GLES renderer, egui painted with `egui_glow`), or,
-with the `kms` feature, on the bare seat: the first connected display at its
-preferred mode through DRM/KMS and GBM, input from libinput, and the GPU and
+with the `kms` feature, on the bare seat: every connected display at its
+preferred mode through DRM/KMS and GBM, the first one the output and the
+others showing the same frame scaled to fit, displays plugged in or out
+followed as they come and go, input from libinput, and the GPU and
 input devices taken through libseat (logind or seatd) and given back on a VT
 switch (Ctrl+Alt+F1–F12). The bare seat is used when neither `WAYLAND_DISPLAY`
 nor `DISPLAY` is set; `MCSAPI_BACKEND=kms` or `=winit` decides instead. On the
@@ -84,8 +86,8 @@ Capture queued after them sees their result. While one runs,
 `Shell::input_source(true)` tells the shell the input is synthetic, so it
 can refuse to let an agent confirm what only a person should.
 
-Not yet: more than one display on the bare seat, hotplug, direct scanout of
-client buffers, XWayland, popup grabs, linux-dmabuf.
+Not yet: displays that extend the desktop rather than mirror it, direct
+scanout of client buffers, XWayland, popup grabs, linux-dmabuf.
 
 ## Protocols
 
@@ -111,7 +113,11 @@ Window hints, passed to `Shell::window_hint`: parents from
 that had the keyboard asked for, or the one a launch puts in
 `XDG_ACTIVATION_TOKEN`, so windows cannot steal focus.
 
-Input and clipboard: `wl_data_device_manager` (clipboard and drag and drop),
+Input and clipboard: `wl_data_device_manager` (clipboard and drag and drop;
+the compositor keeps a copy of each selection's text, HTML, file lists and
+one picture, and serves it once the client that copied it has gone, and
+in-process apps and the chrome copy and paste with Ctrl+C, Ctrl+X and
+Ctrl+V like any client),
 `zwp_primary_selection_device_manager_v1` (middle-click paste),
 `zwp_pointer_gestures_v1`, `zwp_text_input_manager_v3` (see
 `Shell::text_input`), `zwp_relative_pointer_manager_v1` and
@@ -170,18 +176,21 @@ hidden window's FIFO barriers still clear every frame.
 
 The display: `zwlr_output_manager_v1` (wlr-randr, kanshi) lists the output;
 a configuration that keeps it as it is succeeds and any other fails, since
-there is one display at one mode. `zwlr_output_power_manager_v1` (wlopm,
+there is one output at one mode, which every display mirrors. `zwlr_output_power_manager_v1` (wlopm,
 swayidle) turns it off, with DPMS on the bare seat, and nothing is drawn
 until it is back on. `zwlr_gamma_control_manager_v1` (gammastep, wlsunset)
-sets the bare seat's gamma ramp for one client at a time; nested it fails.
+sets the bare seat's gamma ramp, on every display, for one client at a
+time; nested it fails.
 
 Screen capture: `ext_image_copy_capture_manager_v1` with output and window
 sources (`ext_output_image_capture_source_manager_v1`,
 `ext_foreign_toplevel_image_capture_source_manager_v1`), and
 `zwlr_screencopy_manager_v1` (grim, wf-recorder, wayvnc,
-xdg-desktop-portal-wlr). Captures go into `wl_shm` buffers from the next
-frame, with or without the pointer; a window is cut out of the frame where
-its content is placed.
+xdg-desktop-portal-wlr). Captures go into `wl_shm` buffers, or dma-bufs on
+the bare seat, from the next frame, with or without the pointer. A Wayland
+client's window is drawn on its own, so nothing covering it on screen is in
+the picture, and neither is the pointer; an in-process app's window is cut
+out of the frame where its content is placed.
 
 Screen lockers: `ext_session_lock_v1` (swaylock, hyprlock). While locked,
 only the locker's surface is shown and every key and pointer event goes to

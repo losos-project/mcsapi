@@ -9,13 +9,18 @@
 //!   grim.
 //! - `zwlr_screencopy_manager_v1`: grim, wf-recorder, wayvnc.
 //!
-//! A capture is copied into the client's `wl_shm` buffer (XRGB, ARGB, XBGR
-//! or ABGR 8888) from the next frame drawn, with or without the pointer as
-//! the client asked; there are no dmabuf captures yet. A window is cut out
-//! of the frame where its content is placed, so whatever covers it (the
-//! chrome's popups) is in the picture too, and a window that is not placed
-//! (minimized, on another workspace) waits until it is. Damage is not
-//! tracked: every frame counts as changed.
+//! A capture is copied from the next frame drawn, with or without the
+//! pointer as the client asked, into the client's buffer: a `wl_shm` one
+//! (XRGB, ARGB, XBGR or ABGR 8888) through a read back from the GPU, or a
+//! dma-buf (XRGB or XBGR 8888, on the GPU's render node) by the GPU itself,
+//! which is what xdg-desktop-portal-wlr hands PipeWire when it can, so a
+//! screen share costs no copy through memory. A Wayland client's window is
+//! drawn on its own, its surfaces alone into a picture of its size, so
+//! nothing that covers it on screen is shared with it, and without the
+//! pointer. An in-process app's window is cut out of the frame where its
+//! content is placed, whatever covers it included. A window that is not
+//! placed (minimized, on another workspace) waits until it is. Damage is
+//! not tracked: every frame counts as changed.
 
 use std::{
     sync::{
@@ -26,6 +31,14 @@ use std::{
 };
 
 use smithay::{
+    backend::{
+        allocator::{Buffer as _, Fourcc, Modifier, format::FormatSet},
+        renderer::{
+            Bind as _, Color32F, Frame as _, ImportDma as _, Offscreen, Renderer as _,
+            element::{Element as _, RenderElement as _, surface::WaylandSurfaceRenderElement},
+            gles::{GlesRenderer, GlesTexture},
+        },
+    },
     reexports::{
         wayland_protocols::ext::{
             foreign_toplevel_list::v1::server::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
@@ -59,13 +72,15 @@ use smithay::{
             protocol::{wl_buffer::WlBuffer, wl_output::Transform, wl_shm::Format},
         },
     },
-    utils::{Clock, Logical, Monotonic, Rectangle},
-    wayland::{foreign_toplevel_list::ForeignToplevelHandle, shm},
+    utils::{
+        Buffer as BufferCoord, Clock, Logical, Monotonic, Rectangle, Scale, Size, Transform as Turn,
+    },
+    wayland::{dmabuf::get_dmabuf, foreign_toplevel_list::ForeignToplevelHandle, shm},
 };
 use tracing::warn;
 
 use super::{Host, security::unsandboxed};
-use crate::{Capture, Shell, WindowId};
+use crate::{Blur, Capture, Placement, Shell, WindowId};
 
 /// The shm formats a capture can be written in.
 const FORMATS: [Format; 4] = [
@@ -74,6 +89,10 @@ const FORMATS: [Format; 4] = [
     Format::Xbgr8888,
     Format::Abgr8888,
 ];
+
+/// The dma-buf formats a capture can be drawn into. The frame's alpha
+/// means nothing, so only formats without one are offered.
+const DMABUF_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb8888, Fourcc::Xbgr8888];
 
 /// What a capture shows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,12 +140,42 @@ struct Request {
     region: Option<Rectangle<i32, Logical>>,
     cursor: bool,
     buffer: WlBuffer,
+    /// For a dma-buf, how drawing into it went this frame.
+    drawn: Drawn,
+    /// For a window drawn on its own into shared memory, its picture.
+    alone: Option<Capture>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Drawn {
+    Not,
+    Done,
+    /// The renderer could not draw into it.
+    Failed,
+}
+
+/// Where dma-buf captures go: the device clients allocate them on, and the
+/// formats, with their modifiers, the renderer can draw into.
+pub(super) struct DmabufTargets {
+    device: u64,
+    formats: Vec<(Fourcc, Vec<Modifier>)>,
+}
+
+/// A dma-buf capture to draw this frame: its request, where in the frame,
+/// and the client's buffer as a texture the frame can draw into.
+pub(super) struct Blit {
+    request: usize,
+    cursor: bool,
+    rect: Rectangle<i32, Logical>,
+    texture: GlesTexture,
 }
 
 #[derive(Default)]
 pub(super) struct Captures {
     pending: Vec<Request>,
     sessions: Vec<ExtImageCopyCaptureSessionV1>,
+    /// `None` until the renderer has been asked, then whatever it said.
+    dmabuf: Option<Option<DmabufTargets>>,
 }
 
 impl Captures {
@@ -140,13 +189,257 @@ impl Captures {
 
     /// Whether a capture waits for a frame drawn with (or without) the
     /// pointer.
-    pub(super) fn wants(&self, cursor: bool) -> bool {
-        self.pending.iter().any(|r| r.cursor == cursor)
+    /// Whether a capture into shared memory waits for the frame, read
+    /// back before the pointer is drawn or after it. A window `alone`
+    /// says is drawn on its own needs nothing of the frame.
+    pub(super) fn wants(&self, cursor: bool, alone: impl Fn(WindowId) -> bool) -> bool {
+        self.pending.iter().any(|r| {
+            r.cursor == cursor
+                && get_dmabuf(&r.buffer).is_err()
+                && !matches!(r.source, Source::Window(id) if alone(id))
+        })
+    }
+
+    /// The captures of windows `alone` says are drawn on their own: each
+    /// request's index and its window.
+    pub(super) fn windows_alone(&self, alone: impl Fn(WindowId) -> bool) -> Vec<(usize, WindowId)> {
+        self.pending
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r.source {
+                Source::Window(id) if alone(id) => Some((i, id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Draws `elements`, a window's surfaces where they are on screen,
+    /// alone into capture `request`'s buffer, `rect` being where the window
+    /// is. A dma-buf is drawn into directly; shared memory gets a picture
+    /// read back from a texture of the window's size, written when the
+    /// frame is delivered.
+    pub(super) fn draw_alone(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        gl: &glow::Context,
+        request: usize,
+        rect: Rectangle<i32, Logical>,
+        elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+    ) {
+        let pending = &mut self.pending[request];
+        let size = (rect.size.w, rect.size.h);
+        if !fits(&pending.buffer, size) || rect.is_empty() {
+            // Failed for its constraints when delivered.
+            return;
+        }
+        let result = match get_dmabuf(&pending.buffer).cloned() {
+            // A dma-buf's first row is the picture's top, as a screen's is.
+            Ok(mut dmabuf) => {
+                draw_window(renderer, &mut dmabuf, rect, elements, Turn::Normal, |_| ())
+            }
+            Err(_) => Offscreen::<GlesTexture>::create_buffer(
+                renderer,
+                Fourcc::Abgr8888,
+                Size::<i32, BufferCoord>::from(size),
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|mut texture| {
+                // Drawn as the frame is, so the read back turns it the
+                // same way.
+                draw_window(
+                    renderer,
+                    &mut texture,
+                    rect,
+                    elements,
+                    Turn::Flipped180,
+                    |_| super::read_frame(gl, [size.0 as u32, size.1 as u32]),
+                )
+            })
+            .map(|picture| pending.alone = Some(picture)),
+        };
+        pending.drawn = match result {
+            Ok(()) => Drawn::Done,
+            Err(e) => {
+                warn!(error = %e, "cannot draw a window on its own for a capture");
+                Drawn::Failed
+            }
+        };
+    }
+
+    /// Draws the frame so far into the dma-buf captures that want it
+    /// (`cursor` or not), once the frame has what they show.
+    pub(super) fn draw_dmabuf(
+        &mut self,
+        gl: &glow::Context,
+        blits: &[Blit],
+        cursor: bool,
+        frame_height: i32,
+    ) {
+        let mut drew = false;
+        for b in blits.iter().filter(|b| b.cursor == cursor) {
+            // SAFETY: called from draw(), with the frame current and bound.
+            let ok = unsafe { blit(gl, b, frame_height) };
+            self.pending[b.request].drawn = if ok { Drawn::Done } else { Drawn::Failed };
+            drew |= ok;
+        }
+        if drew {
+            use glow::HasContext as _;
+            // The client reads its buffer as soon as it is told it is
+            // ready, without a fence to wait on.
+            // SAFETY: as above.
+            unsafe { gl.finish() };
+        }
+    }
+
+    /// Whether the renderer still has to say where dma-buf captures go.
+    pub(super) fn dmabuf_unknown(&self) -> bool {
+        self.dmabuf.is_none()
+    }
+
+    /// What the renderer said: the client device and the formats it can
+    /// draw into, of which those in [`DMABUF_FORMATS`] are offered.
+    pub(super) fn set_dmabuf(&mut self, device: Option<u64>, renderable: &FormatSet) {
+        self.dmabuf = Some(device.and_then(|device| {
+            let formats: Vec<(Fourcc, Vec<Modifier>)> = DMABUF_FORMATS
+                .into_iter()
+                .map(|code| {
+                    let modifiers = renderable
+                        .iter()
+                        .filter(|f| f.code == code)
+                        .map(|f| f.modifier)
+                        .collect::<Vec<_>>();
+                    (code, modifiers)
+                })
+                .filter(|(_, modifiers)| !modifiers.is_empty())
+                .collect();
+            (!formats.is_empty()).then_some(DmabufTargets { device, formats })
+        }));
+    }
+
+    fn dmabuf_targets(&self) -> Option<&DmabufTargets> {
+        self.dmabuf.as_ref().and_then(Option::as_ref)
     }
 }
 
-/// The buffer's layout, if it is shm in a format we write and fits `size`.
+/// Draws a window's `elements` into `target`, of `rect`'s size, moved so
+/// `rect`'s corner is the target's and turned by `turn`, then hands `read`
+/// the finished target while it is still bound.
+fn draw_window<T, R>(
+    renderer: &mut GlesRenderer,
+    target: &mut T,
+    rect: Rectangle<i32, Logical>,
+    elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
+    turn: Turn,
+    read: impl FnOnce(&mut GlesRenderer) -> R,
+) -> Result<R, String>
+where
+    GlesRenderer: smithay::backend::renderer::Bind<T>,
+{
+    let scale = Scale::from(1.0);
+    let size = rect.size.to_physical(1);
+    let origin = rect.loc.to_physical(1);
+    let full = Rectangle::from_size(size);
+    let mut framebuffer = renderer.bind(target).map_err(|e| e.to_string())?;
+    {
+        let mut frame = renderer
+            .render(&mut framebuffer, size, turn)
+            .map_err(|e| e.to_string())?;
+        frame
+            .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[full])
+            .map_err(|e| e.to_string())?;
+        for element in elements.iter().rev() {
+            let mut dst = element.geometry(scale);
+            dst.loc -= origin;
+            let Some(visible) = dst.intersection(full) else {
+                continue;
+            };
+            // Damage is relative to `dst`.
+            let damage = Rectangle::new(visible.loc - dst.loc, visible.size);
+            element
+                .draw(&mut frame, element.src(), dst, &[damage], &[])
+                .map_err(|e| e.to_string())?;
+        }
+        // Waited on: the client reads a dma-buf as soon as it is told the
+        // frame is ready.
+        let sync = frame.finish().map_err(|e| e.to_string())?;
+        if sync.wait().is_err() {
+            return Err("interrupted waiting for the drawing to finish".into());
+        }
+    }
+    drop(framebuffer);
+    Ok(read(renderer))
+}
+
+/// Whether `buffer` is a dma-buf of `size` in a format captures draw into.
+fn dmabuf_fits(buffer: &WlBuffer, (w, h): (i32, i32)) -> Option<bool> {
+    let dmabuf = get_dmabuf(buffer).ok()?;
+    let size = dmabuf.size();
+    Some(size.w == w && size.h == h && DMABUF_FORMATS.contains(&dmabuf.format().code))
+}
+
+/// Copies `rect` of the frame being drawn into `blit`'s texture, top row
+/// first as a dma-buf's rows run, where GL's run from the bottom.
+///
+/// # Safety
+///
+/// The frame's context must be current, with the frame bound.
+pub(super) unsafe fn blit(gl: &glow::Context, blit: &Blit, frame_height: i32) -> bool {
+    use glow::HasContext as _;
+    let Some(id) = std::num::NonZeroU32::new(blit.texture.tex_id()) else {
+        return false;
+    };
+    let r = blit.rect;
+    // SAFETY: the caller's context is current; everything bound or
+    // enabled here is put back before returning.
+    unsafe {
+        let frame = gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING);
+        let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+        let Ok(fbo) = gl.create_framebuffer() else {
+            return false;
+        };
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::DRAW_FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(glow::NativeTexture(id)),
+            0,
+        );
+        let complete =
+            gl.check_framebuffer_status(glow::DRAW_FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+        if complete {
+            // A scissor the frame left set would cut the copy short.
+            gl.disable(glow::SCISSOR_TEST);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, frame);
+            let bottom = frame_height - r.loc.y - r.size.h;
+            gl.blit_framebuffer(
+                r.loc.x,
+                bottom,
+                r.loc.x + r.size.w,
+                bottom + r.size.h,
+                0,
+                r.size.h,
+                r.size.w,
+                0,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
+            if scissor {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+        }
+        gl.bind_framebuffer(glow::FRAMEBUFFER, frame);
+        gl.delete_framebuffer(fbo);
+        complete
+    }
+}
+
+/// Whether the buffer is one a capture of `size` can go into: shm in a
+/// format we write, or a dma-buf in one we draw into.
 fn fits(buffer: &WlBuffer, size: (i32, i32)) -> bool {
+    if let Some(fits) = dmabuf_fits(buffer, size) {
+        return fits;
+    }
     shm::with_buffer_contents(buffer, |_, len, data| {
         data.width == size.0
             && data.height == size.1
@@ -249,7 +542,7 @@ impl<S: Shell + 'static> Host<S> {
                     let mut last = data.size.lock().unwrap_or_else(|e| e.into_inner());
                     if *last != Some(size) {
                         *last = Some(size);
-                        send_constraints(&session, size);
+                        send_constraints(&session, size, self.screen_capture.dmabuf_targets());
                     }
                 }
             }
@@ -258,8 +551,97 @@ impl<S: Shell + 'static> Host<S> {
         self.screen_capture.sessions = alive;
     }
 
+    /// Whether a capture of window `id` draws it on its own: a Wayland
+    /// client's, whose surfaces can be drawn without the rest.
+    pub(super) fn drawn_alone(&self, id: WindowId) -> bool {
+        matches!(self.windows.get(&id), Some(super::Content::Wayland(_)))
+    }
+
+    /// Draws each capture of a window in `alone` on its own, after the
+    /// frame: its `surfaces` (as the frame drew them, one entry per
+    /// placement) into the capture's buffer. Whether there were any.
+    pub(super) fn draw_windows_alone(
+        &mut self,
+        gl: &glow::Context,
+        placements: &[Placement],
+        surfaces: &[(Vec<Blur>, Vec<WaylandSurfaceRenderElement<GlesRenderer>>)],
+        alone: &[WindowId],
+    ) -> bool {
+        let requests = self.screen_capture.windows_alone(|id| alone.contains(&id));
+        let mut drew = false;
+        for &(request, window) in &requests {
+            // Not drawn this frame until it is, whatever it was last.
+            self.screen_capture.pending[request].drawn = Drawn::Not;
+            self.screen_capture.pending[request].alone = None;
+            if self.lock.locked {
+                continue;
+            }
+            let Some((p, (_, elements))) = placements
+                .iter()
+                .zip(surfaces)
+                .find(|(p, _)| p.window == window)
+            else {
+                continue;
+            };
+            let rect = Rectangle::new(p.client.loc, p.client.size);
+            let renderer = self.backend.renderer();
+            self.screen_capture
+                .draw_alone(renderer, gl, request, rect, elements);
+            drew = true;
+        }
+        // Drawing elsewhere took a window's own surface off the context;
+        // it is made current again for the swap that follows.
+        if drew
+            && !self.backend.offscreen()
+            && let super::Backend::Winit(backend) = &mut self.backend
+            && let Err(e) = backend.bind()
+        {
+            warn!(error = %e, "cannot draw to the window again after a capture");
+        }
+        !requests.is_empty()
+    }
+
+    /// The dma-buf captures this frame draws, each client buffer made a
+    /// texture before the frame starts; one that cannot be is failed when
+    /// the frame is delivered.
+    pub(super) fn dmabuf_blits(&mut self) -> Vec<Blit> {
+        let wanted: Vec<(usize, bool, Rectangle<i32, Logical>)> = self
+            .screen_capture
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| get_dmabuf(&r.buffer).is_ok())
+            .filter(|(_, r)| !matches!(r.source, Source::Window(id) if self.drawn_alone(id)))
+            .filter_map(|(i, r)| {
+                let rect = self.capture_rect(r.source)?;
+                Some((i, r.cursor, r.region.unwrap_or(rect)))
+            })
+            .collect();
+        let mut blits = Vec::with_capacity(wanted.len());
+        for (request, cursor, rect) in wanted {
+            let pending = &mut self.screen_capture.pending[request];
+            let Ok(dmabuf) = get_dmabuf(&pending.buffer).cloned() else {
+                continue;
+            };
+            match self.backend.renderer().import_dmabuf(&dmabuf, None) {
+                Ok(texture) => blits.push(Blit {
+                    request,
+                    cursor,
+                    rect,
+                    texture,
+                }),
+                Err(e) => {
+                    warn!(error = %e, "cannot draw a capture into its dma-buf");
+                    pending.drawn = Drawn::Failed;
+                }
+            }
+        }
+        blits
+    }
+
     /// Fills the captures that wait for this frame: `bare` was read before
-    /// the pointer was drawn, `with_cursor` after.
+    /// the pointer was drawn, `with_cursor` after, and dma-bufs were drawn
+    /// into during it.
     pub(super) fn deliver_captures(
         &mut self,
         bare: Option<&Capture>,
@@ -284,17 +666,38 @@ impl<S: Shell + 'static> Host<S> {
                 (Some(region), Some(_)) => region,
                 (None, Some(rect)) => rect,
             };
-            let Some(frame) = frame else {
-                self.screen_capture.pending.push(request);
-                continue;
-            };
             if !fits(&request.buffer, (rect.size.w, rect.size.h)) {
                 fail(&request.target, FailureReason::BufferConstraints);
                 continue;
             }
-            if !write(&request.buffer, frame, rect) {
-                fail(&request.target, FailureReason::Unknown);
-                continue;
+            if let Some(alone) = &request.alone {
+                if !write(&request.buffer, alone, Rectangle::from_size(rect.size)) {
+                    fail(&request.target, FailureReason::Unknown);
+                    continue;
+                }
+            } else if get_dmabuf(&request.buffer).is_ok()
+                || matches!(request.source, Source::Window(id) if self.drawn_alone(id))
+            {
+                match request.drawn {
+                    Drawn::Done => {}
+                    Drawn::Failed => {
+                        fail(&request.target, FailureReason::BufferConstraints);
+                        continue;
+                    }
+                    Drawn::Not => {
+                        self.screen_capture.pending.push(request);
+                        continue;
+                    }
+                }
+            } else {
+                let Some(frame) = frame else {
+                    self.screen_capture.pending.push(request);
+                    continue;
+                };
+                if !write(&request.buffer, frame, rect) {
+                    fail(&request.target, FailureReason::Unknown);
+                    continue;
+                }
             }
             let (w, h) = (rect.size.w, rect.size.h);
             match request.target {
@@ -324,10 +727,24 @@ fn fail(target: &Target, reason: FailureReason) {
 }
 
 /// Sends a session what its buffers must be.
-fn send_constraints(session: &ExtImageCopyCaptureSessionV1, (w, h): (i32, i32)) {
+fn send_constraints(
+    session: &ExtImageCopyCaptureSessionV1,
+    (w, h): (i32, i32),
+    dmabuf: Option<&DmabufTargets>,
+) {
     session.buffer_size(w.max(1) as u32, h.max(1) as u32);
     for format in FORMATS {
         session.shm_format(format);
+    }
+    if let Some(targets) = dmabuf {
+        session.dmabuf_device(targets.device.to_ne_bytes().to_vec());
+        for (code, modifiers) in &targets.formats {
+            let modifiers = modifiers
+                .iter()
+                .flat_map(|m| u64::from(*m).to_ne_bytes())
+                .collect();
+            session.dmabuf_format(*code as u32, modifiers);
+        }
     }
     session.done();
 }
@@ -608,6 +1025,8 @@ impl<S: Shell + 'static> Dispatch<ExtImageCopyCaptureFrameV1, ExtFrameData> for 
                     region: None,
                     cursor: session.cursor,
                     buffer,
+                    drawn: Drawn::Not,
+                    alone: None,
                 });
             }
             _ => {}
@@ -690,6 +1109,11 @@ impl<S: Shell + 'static> Dispatch<ZwlrScreencopyManagerV1, ()> for Host<S> {
         let (w, h) = (region.size.w as u32, region.size.h as u32);
         frame.buffer(Format::Xrgb8888, w, h, w * 4);
         if frame.version() >= 3 {
+            if let Some(targets) = host.screen_capture.dmabuf_targets() {
+                for (code, _) in &targets.formats {
+                    frame.linux_dmabuf(*code as u32, w, h);
+                }
+            }
             frame.buffer_done();
         }
     }
@@ -734,6 +1158,8 @@ impl<S: Shell + 'static> Dispatch<ZwlrScreencopyFrameV1, WlrFrameData> for Host<
             region: Some(data.region),
             cursor: data.cursor,
             buffer,
+            drawn: Drawn::Not,
+            alone: None,
         });
     }
 
