@@ -23,7 +23,27 @@ switch (Ctrl+Alt+F1–F12). The bare seat is used when neither `WAYLAND_DISPLAY`
 nor `DISPLAY` is set; `MCSAPI_BACKEND=kms` or `=winit` decides instead. On the
 bare seat each frame is drawn offscreen and copied to the scanout buffer, so
 every layer comes out the same as nested; `MCSAPI_OFFSCREEN=1` takes the same
-path in a window, to compare the two.
+path in a window, to compare the two. The display is driven by the GPU the
+firmware started on, or by the one `MCSAPI_DRM_DEVICE` names
+(`/dev/dri/card1`); once that card is given to a virtual machine, by the next
+GPU on a bus, usually the one built into the CPU, before the firmware's
+framebuffer.
+
+Drawing only what changed: nothing is drawn while nothing on screen changes,
+and the cursor is drawn over the offscreen frame as it is copied, not into it.
+Moving the pointer or a client's commit builds the chrome's and the in-process
+apps' passes, so a highlight under the pointer still shows; when they and the
+windows' placements come out as on the frame before, only what the clients'
+surfaces damaged is redrawn, clipped to the box around it, and only that box,
+the areas the cursor left and reached, and what the screen buffer missed since
+it was last shown (its age) are copied. A pointer move over a client, or over
+chrome that does not change under it, costs two cursor-sized copies, and a
+keystroke in a terminal redraws the few cells it changed. A blur within reach
+of the change, or a change in the chrome, redraws the whole frame. This
+matters most where the CPU draws (Mesa's llvmpipe), which is what the desktop
+runs on when its GPU is given to a virtual machine.
+`RUST_LOG=mcsapi_compositor::frames=debug` counts the frames that only moved
+the cursor as `cursor_only`.
 
 Effects: shells can ask for frosted-glass panels by returning areas from
 `Shell::blur_regions`; the host blurs what is behind them (dual Kawase, with

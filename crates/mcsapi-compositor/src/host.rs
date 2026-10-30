@@ -4,6 +4,8 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
+    fs::File,
+    hash::{Hash, Hasher},
     io,
     os::{
         fd::AsRawFd,
@@ -48,10 +50,10 @@ use smithay::{
         renderer::{
             Bind, Color32F, Frame, Offscreen, Renderer, Texture,
             element::{
-                AsRenderElements, Element, RenderElement, surface::WaylandSurfaceRenderElement,
+                AsRenderElements, Element, Id, RenderElement, surface::WaylandSurfaceRenderElement,
             },
             gles::{GlesFrame, GlesRenderer, GlesTexture},
-            utils::on_commit_buffer_handler,
+            utils::{CommitCounter, on_commit_buffer_handler},
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
@@ -314,6 +316,21 @@ pub(crate) struct Host<S: Shell> {
     backend: Backend,
     /// The offscreen frame, when [`Backend::offscreen`].
     scene: Option<GlesTexture>,
+    /// What `scene` was drawn from, while it holds everything but the
+    /// cursor (see [`scene_key`]). A frame built from the same passes and
+    /// placements, with no client or shell change since, copies it to the
+    /// screen again with the cursor where it is now instead of drawing it
+    /// all: moving the pointer over a client, or over chrome that does not
+    /// change under it, costs the copy of two cursor-sized areas.
+    scene_key: Option<u64>,
+    /// Where the cursor was drawn over the scene on the last frame copied
+    /// to the screen, and what it showed ([`cursor::Drawn::id`]).
+    shown_cursor: Option<(Rectangle<i32, Physical>, u64)>,
+    /// The areas each of the last frames copied to the screen changed,
+    /// newest first. A screen buffer last drawn `n` frames ago is brought up
+    /// to date by copying the areas of the `n - 1` frames since and of this
+    /// one, which after a cursor-only frame is a few cursor-sized squares.
+    presented: VecDeque<Vec<Rectangle<i32, Physical>>>,
     gl: Option<Arc<glow::Context>>,
     retired: Vec<egui_glow::Painter>,
     blurrer: Option<blur::Blurrer>,
@@ -346,6 +363,18 @@ pub(crate) struct Host<S: Shell> {
     /// only when this holds, egui asked for a frame, or the shell needs one
     /// ([`Shell::needs_frame`]).
     dirty: bool,
+    /// The pointer moved since the last frame. Unlike [`Host::dirty`] it
+    /// does not by itself redraw the scene: the frame is built, and drawn
+    /// only if the chrome or an in-process app shows something different
+    /// for the move, such as a highlight under the pointer.
+    moved: bool,
+    /// A client sent a request since the last frame, such as a commit.
+    /// Like `moved` it builds a frame without redrawing all of the scene:
+    /// the surfaces are redrawn where their damage says, with whatever is
+    /// above and below them there.
+    requested: bool,
+    /// Each surface as the scene last drew it, to tell what changed since.
+    seen: HashMap<Id, Seen>,
     chrome_events: Vec<egui::Event>,
     /// When the chrome's queued presses and releases happened.
     chrome_clicks: mcsapi_ui::ClickTiming,
@@ -591,8 +620,12 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         Generic::new(display, Interest::READ, CalloopMode::Level),
         |_, display, host| {
             // Most requests change what is shown, and an idle client sends
-            // none, so any of them is reason enough to draw.
-            host.dirty = true;
+            // none, so any of them is reason enough to build a frame. What
+            // they change is on their surfaces, which `draw` redraws where
+            // they say they changed, or in the placements and passes the
+            // frame is built from; what else they change marks the frame
+            // `dirty` where it is handled (a session lock, display power).
+            host.requested = true;
             // SAFETY: the display outlives the event loop's sources.
             unsafe { display.get_mut().dispatch_clients(host)? };
             Ok(PostAction::Continue)
@@ -686,6 +719,9 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         output,
         backend,
         scene: None,
+        scene_key: None,
+        shown_cursor: None,
+        presented: VecDeque::new(),
         gl: None,
         retired: Vec::new(),
         blurrer: None,
@@ -705,6 +741,9 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
         decorations: Egui::new(&repaint),
         repaint,
         dirty: true,
+        moved: false,
+        requested: false,
+        seen: HashMap::new(),
         chrome_events: Vec::new(),
         chrome_clicks: Default::default(),
         chrome_access: None,
@@ -834,6 +873,7 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
             if FrameStats::enabled() {
                 match tick {
                     Tick::Drawn => host.frames.drawn(start, start.elapsed()),
+                    Tick::Cursor => host.frames.cursor(start, start.elapsed()),
                     Tick::Busy => host.frames.skipped(),
                     Tick::Idle => host.frames.idle(),
                 }
@@ -864,6 +904,8 @@ pub(crate) fn run<S: Shell + 'static>(config: Compositor<S>) -> Result {
 enum Tick {
     /// Drew a frame.
     Drawn,
+    /// Copied the frame drawn before with the cursor somewhere else.
+    Cursor,
     /// Drew nothing: the display was off or had frames enough queued.
     Busy,
     /// Drew nothing: nothing on screen changed.
@@ -1341,8 +1383,11 @@ impl<S: Shell> Host<S> {
     }
 
     fn winit_event(&mut self, event: WinitEvent) {
-        // A resize, input, or the window shown again after being covered.
-        self.dirty = true;
+        // A resize, or the window shown again after being covered; input
+        // says itself whether it changes the scene (see `input`).
+        if !matches!(event, WinitEvent::Input(_)) {
+            self.dirty = true;
+        }
         match event {
             WinitEvent::Resized { size, .. } => self.resize_output(size),
             WinitEvent::Input(event) => self.input(event),
@@ -1404,7 +1449,11 @@ impl<S: Shell> Host<S> {
     /// Routes one input event. Generic so a libinput backend, which also
     /// reports touchpad gestures, can share it; winit reports none.
     fn input<B: InputBackend>(&mut self, event: InputEvent<B>) {
-        self.dirty = true;
+        // Input shows on screen through the chrome and in-process apps,
+        // whose passes the frame compares, through the shell's placements,
+        // also compared, or through the clients it reaches, which commit;
+        // moving the pointer may change nothing but where the cursor is.
+        self.moved = true;
         self.set_synthetic(false);
         self.seat_activity();
         match event {
@@ -2537,8 +2586,11 @@ impl<S: Shell> Host<S> {
             .clamp(Duration::from_millis(4), Duration::from_secs(1))
     }
 
-    /// Whether this tick draws a frame (see [`Host::dirty`]).
-    fn frame_wanted(&mut self) -> bool {
+    /// Whether this tick builds a frame (see [`Host::dirty`]), and if so
+    /// whether it must draw the scene again whatever the frame holds: a
+    /// client, the shell or the agent changed something egui's passes do
+    /// not show.
+    fn frame_wanted(&mut self) -> Option<bool> {
         // Asked every tick, not only when nothing else wants a frame, so
         // the shell can keep track of what it last showed.
         let shell = self.shell.needs_frame();
@@ -2549,7 +2601,8 @@ impl<S: Shell> Host<S> {
         // The agent's queue moves one command per frame, and its reads wait
         // for the frames that show what came before them.
         let agent = !self.agent_queue.is_empty() || self.settle > 0 || !self.captures.is_empty();
-        self.dirty || shell || egui || agent
+        let forced = self.dirty || shell || agent;
+        (forced || egui || self.moved || self.requested).then_some(forced)
     }
 
     /// Draws one frame: background, then per window its decoration and
@@ -2572,13 +2625,15 @@ impl<S: Shell> Host<S> {
         self.run_commands();
         self.agent_step();
         self.sync();
-        if !self.frame_wanted() {
+        let Some(forced) = self.frame_wanted() else {
             // A commit timer still falls due, and a fifo barrier still
             // clears, with nothing to draw.
             self.release_barriers();
             return Tick::Idle;
-        }
+        };
         self.dirty = false;
+        self.moved = false;
+        self.requested = false;
         let size = self.backend.size();
         let screen =
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size.w as f32, size.h as f32));
@@ -2653,7 +2708,45 @@ impl<S: Shell> Host<S> {
         } else {
             app_cursor.unwrap_or_default()
         });
+        let on_client = self
+            .seat
+            .get_pointer()
+            .is_some_and(|p| p.current_focus().is_some());
+        let cursor_drawn = self.cursors.drawn(
+            self.backend.renderer(),
+            on_client,
+            self.pointer,
+            self.start.elapsed(),
+        );
 
+        // The cursor goes into the scene where the scene is the screen (a
+        // window drawn into directly), where egui paints it (the screen is
+        // turned the other way up from egui's GL; see `kms.rs`), and where
+        // a capture wants it; then the scene cannot be shown again with the
+        // cursor elsewhere.
+        let in_scene = !self.backend.offscreen()
+            || matches!(cursor_drawn, cursor::Drawn::Painted)
+            || !self.captures.is_empty()
+            || self.screen_capture.wants(true);
+        let key = (!in_scene && !self.wants_pictures && !self.screen_capture.wants(false))
+            .then(|| {
+                scene_key(
+                    (size, self.lock.locked),
+                    &placements,
+                    &blurs,
+                    [&background, &chrome]
+                        .into_iter()
+                        .chain(&decorations)
+                        .chain(contents.iter().flatten()),
+                    &cursor,
+                )
+            })
+            .flatten();
+        // Unless something else changed, the scene is drawn again only
+        // where surfaces changed, and copied to the screen only there and
+        // where the cursor moved: egui's passes and the placements came out
+        // as for the scene already drawn.
+        let partial = !forced && key.is_some() && key == self.scene_key;
         self.take_presentation_feedback();
         let drawn = self.draw(
             size,
@@ -2664,12 +2757,25 @@ impl<S: Shell> Host<S> {
             &blurs,
             chrome,
             cursor,
+            cursor_drawn,
+            in_scene,
+            partial,
         );
+        self.scene_key = key.filter(|_| drawn.is_ok());
+        let outcome = drawn.as_ref().map_or(Scene::Drawn, |(_, outcome)| *outcome);
+        if outcome == Scene::Unchanged {
+            // egui ran for a move or an animation, or a client committed
+            // nothing new, and nothing on screen changed.
+            self.release_barriers();
+            self.send_frames();
+            self.run_commands();
+            return Tick::Idle;
+        }
         self.frame_drawn(drawn.is_ok());
         // A frame that failed is tried again on the next tick.
         self.dirty |= drawn.is_err();
         let capture = match drawn {
-            Ok(capture) => capture.map(Ok),
+            Ok((capture, _)) => capture.map(Ok),
             Err(e) => {
                 error!(error = %e, "render failed");
                 Some(Err(e.to_string()))
@@ -2687,6 +2793,16 @@ impl<S: Shell> Host<S> {
             self.atspi = Some(atspi);
         }
 
+        self.send_frames();
+        self.run_commands();
+        match outcome {
+            Scene::Cursor => Tick::Cursor,
+            _ => Tick::Drawn,
+        }
+    }
+
+    /// Tells every surface on screen a frame was shown.
+    fn send_frames(&mut self) {
         let now = self.start.elapsed();
         for window in self.space.elements() {
             window.send_frame(&self.output, now, Some(Duration::ZERO), |_, _| {
@@ -2701,8 +2817,6 @@ impl<S: Shell> Host<S> {
                 Some(self.output.clone())
             });
         }
-        self.run_commands();
-        Tick::Drawn
     }
 
     fn paint_only(
@@ -2808,7 +2922,10 @@ impl<S: Shell> Host<S> {
         blurs: &[Blur],
         mut chrome: Pass,
         mut cursor: Pass,
-    ) -> std::result::Result<Option<Capture>, Box<dyn std::error::Error>> {
+        cursor_drawn: cursor::Drawn,
+        in_scene: bool,
+        partial: bool,
+    ) -> std::result::Result<(Option<Capture>, Scene), Box<dyn std::error::Error>> {
         let scale = Scale::from(1.0);
         let screen_px = [size.w as u32, size.h as u32];
         let full = Rectangle::from_size(size);
@@ -2822,6 +2939,10 @@ impl<S: Shell> Host<S> {
                 buffer_size,
             )?);
         }
+        // The scene is bound only once this frame is known to draw: on
+        // llvmpipe binding it cost a cursor-only frame some 7 ms, five
+        // times what the rest of it took.
+        let renderer = self.backend.renderer();
         if self.screen_capture.dmabuf_unknown() {
             let device = self.backend.client_device();
             let renderable = self
@@ -2943,13 +3064,80 @@ impl<S: Shell> Host<S> {
         let lock_elements = self.lock.elements(renderer);
         let input_popups = self.input_method.elements(renderer, scale);
 
-        let on_client = self
-            .seat
-            .get_pointer()
-            .is_some_and(|p| p.current_focus().is_some());
-        let cursor_drawn =
-            self.cursors
-                .drawn(renderer, on_client, self.pointer, self.start.elapsed());
+        // What the surfaces changed since the scene was last drawn. Kept up
+        // on every frame, and used on one that may redraw only part of it.
+        let changed = surface_damage(
+            &mut self.seen,
+            surfaces
+                .iter()
+                .chain(&wlr_below)
+                .chain(&wlr_top)
+                .chain(&wlr_overlay)
+                .map(|(_, elements)| elements)
+                .chain(&panels)
+                .chain(&overlays)
+                .chain([&lock_elements, &input_popups])
+                .flatten(),
+            scale,
+        );
+        let area = if partial {
+            match changed
+                .into_iter()
+                .reduce(|a, b| a.merge(b))
+                .and_then(|a| a.intersection(full))
+            {
+                None => {
+                    // Nothing in the scene changed: at most the cursor moved.
+                    let moved = cursor_drawn.area().map(|a| (a, cursor_drawn.id()));
+                    if moved == self.shown_cursor {
+                        return Ok((None, Scene::Unchanged));
+                    }
+                    self.present(size, Some(cursor_drawn), Changed::Cursor)?;
+                    return Ok((None, Scene::Cursor));
+                }
+                Some(area) => Some(area),
+            }
+        } else {
+            None
+        };
+        // A blur near the change blurs some of it, and a blur redrawn in
+        // part would blur its own output: the area grows to take in each
+        // blur it reaches, whole, which then reaches others. A terminal's
+        // first line, under the top bar's blur, redraws its line and the
+        // bar rather than the screen.
+        let reachable: Vec<&Blur> = blurs
+            .iter()
+            .chain(
+                surfaces
+                    .iter()
+                    .chain(&wlr_below)
+                    .chain(&wlr_top)
+                    .chain(&wlr_overlay)
+                    .flat_map(|(behind, _)| behind),
+            )
+            .collect();
+        let area = area.map(|area| grow_over_blurs(area, &reachable, full));
+        // Where this frame draws, and where the screen changes: all of it,
+        // or the area the surfaces and the blurs they reach changed. Only
+        // the blurs inside it are drawn again; the rest are already right.
+        let clip = area.unwrap_or(full);
+        let redrawn = |blurs: &[Blur]| -> Vec<Blur> {
+            blurs
+                .iter()
+                .filter(|b| area.is_none_or(|a| a.overlaps(blur_rect(b))))
+                .copied()
+                .collect()
+        };
+        let (renderer, mut framebuffer) = match (&mut self.backend, &mut self.scene) {
+            (backend, Some(scene)) if offscreen => {
+                let renderer = backend.renderer();
+                let framebuffer = renderer.bind(scene)?;
+                (renderer, framebuffer)
+            }
+            (Backend::Winit(backend), _) => backend.bind()?,
+            #[cfg(feature = "kms")]
+            (Backend::Kms(_), _) => unreachable!("the bare seat always draws offscreen"),
+        };
 
         // The background is drawn only where no opaque window covers it.
         // Under two tiled windows the wallpaper was filled in full every
@@ -2987,18 +3175,18 @@ impl<S: Shell> Host<S> {
         }
 
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-        frame.clear(Color32F::new(0.06, 0.09, 0.16, 1.0), &[full])?;
+        frame.clear(Color32F::new(0.06, 0.09, 0.16, 1.0), &[clip])?;
         let deco = self.decorations.painter.as_mut().expect("created above");
-        paint(&gl, deco, screen_px, &mut background);
+        paint_in(&gl, deco, screen_px, &mut background, area);
         for (behind, elements) in &wlr_below {
             blur_behind(
                 &mut self.blurrer,
                 &mut self.blur_unavailable,
                 &gl,
                 screen_px,
-                behind,
+                &redrawn(behind),
             );
-            draw_surfaces(&mut frame, elements, scale)?;
+            draw_surfaces(&mut frame, elements, scale, area)?;
         }
         for (((p, mut decoration), content), (behind, elements)) in placements
             .iter()
@@ -3011,7 +3199,7 @@ impl<S: Shell> Host<S> {
             if let Some((frame, m)) = motion {
                 move_pass(&mut decoration, frame, m);
             }
-            paint(&gl, deco, screen_px, &mut decoration);
+            paint_in(&gl, deco, screen_px, &mut decoration, area);
             if let (Some(mut pass), Some(Content::Internal { egui, .. })) =
                 (content, self.windows.get_mut(&p.window))
             {
@@ -3019,7 +3207,7 @@ impl<S: Shell> Host<S> {
                     move_pass(&mut pass, frame, m);
                 }
                 let painter = egui.painter.as_mut().expect("created above");
-                paint(&gl, painter, screen_px, &mut pass);
+                paint_in(&gl, painter, screen_px, &mut pass, area);
             }
             // What a client blurs behind it is where it will be; while it
             // moves there is nothing steady to blur.
@@ -3029,10 +3217,10 @@ impl<S: Shell> Host<S> {
                     &mut self.blur_unavailable,
                     &gl,
                     screen_px,
-                    behind,
+                    &redrawn(behind),
                 );
             }
-            draw_moved_surfaces(&mut frame, elements, scale, motion)?;
+            draw_moved_surfaces(&mut frame, elements, scale, motion, area)?;
         }
         // The windows as they are now, before the chrome's blur and panels
         // cover them.
@@ -3047,10 +3235,10 @@ impl<S: Shell> Host<S> {
             &mut self.blur_unavailable,
             &gl,
             screen_px,
-            blurs,
+            &redrawn(blurs),
         );
         for elements in &panels {
-            draw_surfaces(&mut frame, elements, scale)?;
+            draw_surfaces(&mut frame, elements, scale, area)?;
         }
         for (behind, elements) in &wlr_top {
             blur_behind(
@@ -3058,14 +3246,14 @@ impl<S: Shell> Host<S> {
                 &mut self.blur_unavailable,
                 &gl,
                 screen_px,
-                behind,
+                &redrawn(behind),
             );
-            draw_surfaces(&mut frame, elements, scale)?;
+            draw_surfaces(&mut frame, elements, scale, area)?;
         }
         let chrome_painter = self.chrome.painter.as_mut().expect("created above");
-        paint(&gl, chrome_painter, screen_px, &mut chrome);
+        paint_in(&gl, chrome_painter, screen_px, &mut chrome, area);
         for elements in &overlays {
-            draw_surfaces(&mut frame, elements, scale)?;
+            draw_surfaces(&mut frame, elements, scale, area)?;
         }
         for (behind, elements) in &wlr_overlay {
             blur_behind(
@@ -3073,17 +3261,17 @@ impl<S: Shell> Host<S> {
                 &mut self.blur_unavailable,
                 &gl,
                 screen_px,
-                behind,
+                &redrawn(behind),
             );
-            draw_surfaces(&mut frame, elements, scale)?;
+            draw_surfaces(&mut frame, elements, scale, area)?;
         }
         // An input method's candidates go over everything but the lock.
-        draw_surfaces(&mut frame, &input_popups, scale)?;
+        draw_surfaces(&mut frame, &input_popups, scale, area)?;
         // Locked: the session is drawn as usual, so egui's passes keep
         // their textures in step, then covered.
         if locked {
-            frame.clear(Color32F::new(0.06, 0.09, 0.16, 1.0), &[full])?;
-            draw_surfaces(&mut frame, &lock_elements, scale)?;
+            frame.clear(Color32F::new(0.06, 0.09, 0.16, 1.0), &[clip])?;
+            draw_surfaces(&mut frame, &lock_elements, scale, area)?;
         }
         let bare = self
             .screen_capture
@@ -3096,28 +3284,14 @@ impl<S: Shell> Host<S> {
             cursor.primitives.clear();
         }
         let deco = self.decorations.painter.as_mut().expect("created above");
-        paint(&gl, deco, screen_px, &mut cursor);
+        paint_in(&gl, deco, screen_px, &mut cursor, area);
         // Held with the frame's other client buffers below.
         let mut cursor_elements = Vec::new();
-        match cursor_drawn {
-            cursor::Drawn::Hidden | cursor::Drawn::Painted => {}
-            cursor::Drawn::Surface(elements) => {
-                draw_surfaces(&mut frame, &elements, scale)?;
-                cursor_elements = elements;
-            }
-            cursor::Drawn::Image { texture, at, size } => {
-                let dst = Rectangle::new(at, size);
-                Frame::render_texture_from_to(
-                    &mut frame,
-                    &texture,
-                    Rectangle::from_size(texture.size()).to_f64(),
-                    dst,
-                    &[Rectangle::from_size(size)],
-                    &[],
-                    Transform::Normal,
-                    1.0,
-                )?;
-            }
+        let mut over = None;
+        if in_scene {
+            cursor_elements = draw_cursor(&mut frame, cursor_drawn)?;
+        } else {
+            over = Some(cursor_drawn);
         }
         let with_cursor = (!self.captures.is_empty()
             || self.screen_capture.wants(true, |id| alone.contains(&id)))
@@ -3157,46 +3331,120 @@ impl<S: Shell> Host<S> {
         }
         let capture = with_cursor.filter(|_| !self.captures.is_empty());
         if offscreen {
-            self.present(size)?;
-            return Ok(capture);
+            self.present(size, over, area.map_or(Changed::All, Changed::Area))?;
+            return Ok((capture, Scene::Drawn));
         }
         match &mut self.backend {
             Backend::Winit(backend) => backend.submit(Some(&[full]))?,
             #[cfg(feature = "kms")]
             Backend::Kms(_) => {}
         }
-        Ok(capture)
+        Ok((capture, Scene::Drawn))
     }
 
-    /// Copies the offscreen frame to the screen.
-    fn present(&mut self, size: Size<i32, Physical>) -> Result {
-        let full = Rectangle::from_size(size);
+    /// Copies the offscreen frame to the screen, and `cursor` over it: what
+    /// `changed` says changed in it, where the cursor was and is, and what the
+    /// screen buffer missed since it was last shown (its age).
+    fn present(
+        &mut self,
+        size: Size<i32, Physical>,
+        cursor: Option<cursor::Drawn>,
+        changed: Changed,
+    ) -> Result {
+        let screen = Rectangle::from_size(size);
         let Some(scene) = &self.scene else {
             return Ok(());
+        };
+        let shown = cursor.as_ref().and_then(|c| c.area().map(|a| (a, c.id())));
+        let full = changed == Changed::All;
+        let changed: Vec<_> = match changed {
+            Changed::All => vec![screen],
+            Changed::Area(area) => std::iter::once(area)
+                .chain(self.shown_cursor.iter().chain(&shown).map(|(a, _)| *a))
+                .filter_map(|a| a.intersection(screen))
+                .collect(),
+            Changed::Cursor => self
+                .shown_cursor
+                .iter()
+                .chain(&shown)
+                .filter_map(|(a, _)| a.intersection(screen))
+                .collect(),
+        };
+        // The areas to copy into a buffer the screen showed `age` frames
+        // ago; all of it for a new buffer, or one older than the history.
+        let presented = &self.presented;
+        let damage = |age: usize| -> Vec<Rectangle<i32, Physical>> {
+            if full || age == 0 || age > presented.len() + 1 {
+                return vec![screen];
+            }
+            presented
+                .iter()
+                .take(age - 1)
+                .flatten()
+                .chain(&changed)
+                .copied()
+                .collect()
         };
         let src = Rectangle::from_size(scene.size()).to_f64();
         match &mut self.backend {
             Backend::Winit(backend) => {
+                let damage = damage(backend.buffer_age().unwrap_or(0));
                 let (renderer, mut framebuffer) = backend.bind()?;
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
                 Frame::render_texture_from_to(
                     &mut frame,
                     scene,
                     src,
-                    full,
-                    &[full],
+                    screen,
+                    &damage,
                     &[],
                     OFFSCREEN_COPY,
                     1.0,
                 )?;
+                if let Some(cursor) = cursor {
+                    draw_cursor(&mut frame, cursor)?;
+                }
                 let _sync = frame.finish()?;
                 drop(framebuffer);
-                backend.submit(Some(&[full]))?;
+                backend.submit(Some(&damage))?;
             }
             // To every display (see `kms.rs`).
             #[cfg(feature = "kms")]
-            Backend::Kms(k) => k.present(scene, OFFSCREEN_COPY, self.timing.pending.take())?,
+            Backend::Kms(k) => {
+                let (mut dmabuf, age) = k.surface.next_buffer()?;
+                let damage = damage(usize::from(age));
+                let mut framebuffer = k.renderer.bind(&mut dmabuf)?;
+                let mut frame = k
+                    .renderer
+                    .render(&mut framebuffer, size, Transform::Normal)?;
+                Frame::render_texture_from_to(
+                    &mut frame,
+                    scene,
+                    src,
+                    screen,
+                    &damage,
+                    &[],
+                    OFFSCREEN_COPY,
+                    1.0,
+                )?;
+                // Held until the vblank, as the scene's client buffers are.
+                if let Some(cursor) = cursor {
+                    let elements = draw_cursor(&mut frame, cursor)?;
+                    k.in_flight.extend(elements);
+                }
+                let sync = frame.finish()?;
+                drop(framebuffer);
+                // The fence goes with the buffer: the flip waits on it in
+                // the kernel (`IN_FENCE_FD`), or Smithay waits on it here
+                // where the plane takes no fence. Nothing relies on the
+                // driver ordering the flip after the drawing by itself.
+                k.surface.queue_buffer(Some(sync), Some(damage), ())?;
+                k.queued(self.timing.pending.take());
+            }
         }
+        self.presented.push_front(changed);
+        self.presented.truncate(PRESENTED_FRAMES);
+        self.shown_cursor = shown;
         Ok(())
     }
 
@@ -3272,12 +3520,131 @@ fn shell_key_route(shell: &mut impl Shell, key: &KeyInput, consumed_release: boo
 }
 
 /// Draws one window's surfaces; Smithay lists them topmost first.
+/// Draws the cursor into `frame`, and returns the client buffers it drew,
+/// to be held until the frame is on screen.
+fn draw_cursor(
+    frame: &mut GlesFrame<'_, '_>,
+    cursor: cursor::Drawn,
+) -> Result<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> {
+    match cursor {
+        cursor::Drawn::Hidden | cursor::Drawn::Painted => Ok(Vec::new()),
+        cursor::Drawn::Surface(elements) => {
+            draw_surfaces(frame, &elements, Scale::from(1.0), None)?;
+            Ok(elements)
+        }
+        cursor::Drawn::Image {
+            texture, at, size, ..
+        } => {
+            Frame::render_texture_from_to(
+                frame,
+                &texture,
+                Rectangle::from_size(texture.size()).to_f64(),
+                Rectangle::new(at, size),
+                &[Rectangle::from_size(size)],
+                &[],
+                Transform::Normal,
+                1.0,
+            )?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// How many frames' areas [`Host::presented`] keeps: past triple
+/// buffering's three, a buffer that old is copied in full anyway.
+const PRESENTED_FRAMES: usize = 4;
+
+/// A fingerprint of everything a scene is drawn from that egui builds each
+/// frame: the screen's size, the windows' placements, the blurs, and the
+/// passes' meshes. `None` when it cannot stand for the scene: a pass
+/// carries a texture update, which must be painted, or a paint callback,
+/// whose drawing no mesh shows. The cursor's own pass counts only for its
+/// texture updates; its mesh follows the pointer and is not in the scene.
+fn scene_key<'a>(
+    (size, locked): (Size<i32, Physical>, bool),
+    placements: &[Placement],
+    blurs: &[Blur],
+    passes: impl IntoIterator<Item = &'a Pass>,
+    cursor: &Pass,
+) -> Option<u64> {
+    let mut hasher = FrameHasher::default();
+    (size.w, size.h, locked).hash(&mut hasher);
+    for p in placements {
+        format!("{p:?}").hash(&mut hasher);
+    }
+    for b in blurs {
+        format!("{b:?}").hash(&mut hasher);
+    }
+    let unchanged = |pass: &Pass| pass.textures.set.is_empty() && pass.textures.free.is_empty();
+    if !unchanged(cursor) {
+        return None;
+    }
+    for pass in passes {
+        if !unchanged(pass) {
+            return None;
+        }
+        // Where one pass ends, so meshes cannot slide between passes.
+        hasher.write_u64(u64::MAX);
+        for clipped in &pass.primitives {
+            let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
+                return None;
+            };
+            let r = clipped.clip_rect;
+            for v in [r.min.x, r.min.y, r.max.x, r.max.y] {
+                hasher.write_u32(v.to_bits());
+            }
+            mesh.texture_id.hash(&mut hasher);
+            hasher.write_u64(mesh.indices.len() as u64);
+            for &i in &mesh.indices {
+                hasher.write_u32(i);
+            }
+            for v in &mesh.vertices {
+                hasher.write_u32(v.pos.x.to_bits());
+                hasher.write_u32(v.pos.y.to_bits());
+                hasher.write_u32(v.uv.x.to_bits());
+                hasher.write_u32(v.uv.y.to_bits());
+                hasher.write_u32(u32::from_le_bytes(v.color.to_array()));
+            }
+        }
+    }
+    Some(hasher.finish())
+}
+
+/// A fast hash for [`scene_key`], which reads every vertex of every frame:
+/// FxHash's multiply and rotate, one word at a time. Only compared with the
+/// key of the frame before, so collisions are as rare as they need to be.
+#[derive(Default)]
+struct FrameHasher(u64);
+
+impl Hasher for FrameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(u64::from(i));
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
 fn draw_surfaces(
     frame: &mut GlesFrame<'_, '_>,
     elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
     scale: Scale<f64>,
+    clip: Option<Rectangle<i32, Physical>>,
 ) -> Result {
-    draw_moved_surfaces(frame, elements, scale, None)
+    draw_moved_surfaces(frame, elements, scale, None, clip)
 }
 
 /// [`draw_surfaces`], stretched from the window's frame to where its
@@ -3287,6 +3654,7 @@ fn draw_moved_surfaces(
     elements: &[WaylandSurfaceRenderElement<GlesRenderer>],
     scale: Scale<f64>,
     motion: Option<(Geometry, Motion)>,
+    clip: Option<Rectangle<i32, Physical>>,
 ) -> Result {
     for element in elements.iter().rev() {
         let mut dst = element.geometry(scale);
@@ -3296,13 +3664,15 @@ fn draw_moved_surfaces(
                 continue;
             }
         }
-        element.draw(
-            frame,
-            element.src(),
-            dst,
-            &[Rectangle::from_size(dst.size)],
-            &[],
-        )?;
+        // Only within `clip`, relative to the surface as Smithay takes it.
+        let damage = match clip {
+            None => Rectangle::from_size(dst.size),
+            Some(clip) => match clip.intersection(dst) {
+                Some(part) => Rectangle::new(part.loc - dst.loc, part.size),
+                None => continue,
+            },
+        };
+        element.draw(frame, element.src(), dst, &[damage], &[])?;
     }
     Ok(())
 }
@@ -3423,6 +3793,133 @@ fn paint_cursor(painter: &egui::Painter, at: egui::Pos2) {
         points,
         egui::Stroke::new(1.5, egui::Color32::WHITE),
     ));
+}
+
+/// Paints an egui pass as [`paint`] does, only within `area` when given.
+fn paint_in(
+    gl: &glow::Context,
+    painter: &mut egui_glow::Painter,
+    screen: [u32; 2],
+    pass: &mut Pass,
+    area: Option<Rectangle<i32, Physical>>,
+) {
+    if let Some(area) = area {
+        clip_pass(pass, &[area]);
+    }
+    paint(gl, painter, screen, pass);
+}
+
+/// What [`Host::draw`] did with the scene.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scene {
+    /// Drew it, all of it or where it changed, and copied it to the screen.
+    Drawn,
+    /// Left it as it was and copied it with the cursor somewhere else.
+    Cursor,
+    /// Left it, and the screen, as they were.
+    Unchanged,
+}
+
+/// What changed in the scene since it was last copied to the screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Changed {
+    /// Any of it.
+    All,
+    /// Only this area.
+    Area(Rectangle<i32, Physical>),
+    /// Nothing; only the cursor moved or changed.
+    Cursor,
+}
+
+/// A surface as the scene last drew it: the commit it showed, where, and
+/// where it said it was opaque, on which the wallpaper's clip depends.
+struct Seen {
+    commit: CommitCounter,
+    geometry: Rectangle<i32, Physical>,
+    opaque: u64,
+}
+
+/// Where `elements` changed on screen since `seen` was taken, and `seen`
+/// brought up to date: the damage each surface reported since the commit
+/// last drawn, all of a surface that is new, moved, resized or changed where
+/// it is opaque, and where a surface no longer drawn was.
+fn surface_damage<'a>(
+    seen: &mut HashMap<Id, Seen>,
+    elements: impl IntoIterator<Item = &'a WaylandSurfaceRenderElement<GlesRenderer>>,
+    scale: Scale<f64>,
+) -> Vec<Rectangle<i32, Physical>> {
+    let mut damage = Vec::new();
+    let mut now = HashMap::with_capacity(seen.len());
+    for element in elements {
+        let geometry = element.geometry(scale);
+        let opaque = {
+            let mut hasher = FrameHasher::default();
+            format!("{:?}", element.opaque_regions(scale)).hash(&mut hasher);
+            hasher.finish()
+        };
+        match seen.remove(element.id()) {
+            Some(before) if before.geometry == geometry && before.opaque == opaque => {
+                damage.extend(
+                    element
+                        .damage_since(scale, Some(before.commit))
+                        .iter()
+                        .map(|d| Rectangle::new(d.loc + geometry.loc, d.size)),
+                );
+            }
+            Some(before) => damage.extend([before.geometry, geometry]),
+            None => damage.push(geometry),
+        }
+        now.insert(
+            element.id().clone(),
+            Seen {
+                commit: element.current_commit(),
+                geometry,
+                opaque,
+            },
+        );
+    }
+    damage.extend(seen.drain().map(|(_, gone)| gone.geometry));
+    *seen = now;
+    damage
+}
+
+/// How far around its area a blur reads what it blurs, generously: the
+/// strongest dual Kawase pass samples a few dozen pixels out.
+const BLUR_REACH: i32 = 96;
+
+/// Whether `blur` reads or covers anything in `area`.
+fn blur_reaches(blur: &Blur, area: Rectangle<i32, Physical>) -> bool {
+    let g = blur.area;
+    Rectangle::<i32, Physical>::new(
+        (g.loc.x - BLUR_REACH, g.loc.y - BLUR_REACH).into(),
+        (g.size.w + 2 * BLUR_REACH, g.size.h + 2 * BLUR_REACH).into(),
+    )
+    .overlaps(area)
+}
+
+/// `area`, grown to take in whole each blur that reaches it, and each blur
+/// those reach in turn, within `screen`.
+fn grow_over_blurs(
+    mut area: Rectangle<i32, Physical>,
+    blurs: &[&Blur],
+    screen: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    while let Some(b) = blurs.iter().find(|b| {
+        blur_reaches(b, area)
+            && !area.contains_rect(blur_rect(b).intersection(screen).unwrap_or(area))
+    }) {
+        area = area
+            .merge(blur_rect(b))
+            .intersection(screen)
+            .unwrap_or(screen);
+    }
+    area
+}
+
+/// Where a blur draws, on the screen.
+fn blur_rect(blur: &Blur) -> Rectangle<i32, Physical> {
+    let g = blur.area;
+    Rectangle::new((g.loc.x, g.loc.y).into(), (g.size.w, g.size.h).into())
 }
 
 /// Paints an egui pass into the bound framebuffer, then restores the GL
@@ -3631,7 +4128,7 @@ impl<S: Shell + 'static> CompositorHandler for Host<S> {
     fn commit(&mut self, surface: &WlSurface) {
         // Also reached outside a client's dispatch, when a commit that
         // waited on its buffer's fences or a commit timer is applied.
-        self.dirty = true;
+        self.requested = true;
         on_commit_buffer_handler::<Self>(surface);
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
@@ -3945,6 +4442,29 @@ impl<S: Shell + 'static> PrimarySelectionHandler for Host<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_under_a_blurs_reach_takes_in_that_blur_and_the_ones_it_reaches() {
+        let screen = Rectangle::from_size((1920, 1080).into());
+        let blur = |x, y, w, h| Blur {
+            area: Geometry::new((x, y).into(), (w, h).into()),
+            corner_radius: 0,
+            strength: 5,
+        };
+        // The top bar, a panel under it, and one far away.
+        let bar = blur(0, 0, 1920, 28);
+        let panel = blur(1500, 40, 400, 300);
+        let far = blur(0, 900, 300, 180);
+        let blurs = [&bar, &panel, &far];
+        // A terminal's first line, just under the bar: the bar, and the
+        // panel within its reach, are drawn again; the far one is not.
+        let line = Rectangle::new((0, 41).into(), (12, 13).into());
+        let grown = grow_over_blurs(line, &blurs, screen);
+        assert_eq!(grown, Rectangle::new((0, 0).into(), (1920, 340).into()));
+        // A change out of every blur's reach stays as it is.
+        let middle = Rectangle::new((900, 600).into(), (12, 13).into());
+        assert_eq!(grow_over_blurs(middle, &blurs, screen), middle);
+    }
 
     #[test]
     fn egui_repaint_requests_come_due_once() {

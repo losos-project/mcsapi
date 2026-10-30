@@ -664,15 +664,42 @@ fn implicit(formats: impl IntoIterator<Item = Format>) -> impl Iterator<Item = F
         .filter(|f| f.modifier == Modifier::Invalid)
 }
 
-/// The seat's primary GPU, else its first.
+/// The GPU to drive the display with: `MCSAPI_DRM_DEVICE` (a path such as
+/// `/dev/dri/card1`) when set, else the seat's primary GPU, else its first
+/// GPU on a bus.
+///
+/// The primary GPU is the one the firmware showed its screen on. Once a
+/// virtual machine is given that card (VFIO), it has no DRM device here and
+/// the display moves to another GPU, typically the one built into the CPU.
+/// The firmware's framebuffer (`simpledrm`) may still be listed for it
+/// then, a platform device with no bus of its own, and is passed over for
+/// any real GPU: it shows nothing once the card is gone.
 fn gpu(seat: &str) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("MCSAPI_DRM_DEVICE") {
+        return Ok(path.into());
+    }
     if let Some(path) = udev::primary_gpu(seat)? {
         return Ok(path);
     }
-    udev::all_gpus(seat)?
-        .into_iter()
-        .next()
+    let gpus = udev::all_gpus(seat)?;
+    gpus.iter()
+        .find(|path| on_a_bus(path))
+        .or_else(|| gpus.first())
+        .cloned()
         .ok_or_else(|| format!("no GPU on seat {seat}").into())
+}
+
+/// Whether the DRM device at `path` (`/dev/dri/cardN`) hangs off PCI or
+/// another bus, rather than being the firmware's framebuffer, which sits
+/// under `/sys/devices/platform`.
+fn on_a_bus(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let device = std::path::Path::new("/sys/class/drm")
+        .join(name)
+        .join("device");
+    std::fs::canonicalize(device).is_ok_and(|real| !real.starts_with("/sys/devices/platform"))
 }
 
 fn refresh_mhz(mode: &Mode) -> u32 {
