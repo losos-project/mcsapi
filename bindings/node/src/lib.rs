@@ -53,6 +53,8 @@ fn policy_error(error: mcsapi::Error) -> Error<String> {
 #[napi(string_enum = "lowercase")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Layout {
+    /// Successive alternating splits forming a spiral.
+    Spiral,
     /// One main window on the left, with the rest stacked vertically on the right.
     Tall,
     /// Every window fills the output; the host displays only the focused one.
@@ -62,6 +64,7 @@ pub enum Layout {
 impl From<Layout> for mcsapi::Layout {
     fn from(layout: Layout) -> Self {
         match layout {
+            Layout::Spiral => Self::Spiral,
             Layout::Tall => Self::Tall,
             Layout::Monocle => Self::Monocle,
         }
@@ -71,8 +74,9 @@ impl From<Layout> for mcsapi::Layout {
 impl From<mcsapi::Layout> for Layout {
     fn from(layout: mcsapi::Layout) -> Self {
         match layout {
+            mcsapi::Layout::Spiral => Self::Spiral,
             mcsapi::Layout::Monocle => Self::Monocle,
-            _ => Self::Tall,
+            mcsapi::Layout::Tall => Self::Tall,
         }
     }
 }

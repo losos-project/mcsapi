@@ -15,11 +15,17 @@ pub struct Placement {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Layout {
+    /// Successive splits alternating horizontal and vertical, forming a spiral.
+    ///
+    /// The first window takes the left half, the next takes the top half of the
+    /// remainder, the next the left half of that, and so on. The last window
+    /// fills whatever is left. A single window fills the output.
+    #[default]
+    Spiral,
     /// One main window on the left, with the rest stacked vertically on the right.
     ///
     /// The main pane receives half the width, rounding down. A single window
     /// fills the output. Remainder pixels are distributed from the top.
-    #[default]
     Tall,
     /// Every window fills the output; the host displays only the focused one.
     Monocle,
@@ -48,6 +54,8 @@ impl Layout {
         if self == Self::Tall && count > 1 && (width < 2 || count - 1 > height as usize) {
             return Err(Error::InsufficientSpace);
         }
+        // Spiral can produce sub-pixel-sized tiles with many windows; the host
+        // is expected to handle or clamp them, as with Tall's stack.
         Ok(Placements {
             windows,
             layout: self,
@@ -73,30 +81,33 @@ impl<I: ExactSizeIterator<Item = WindowId>> Iterator for Placements<I> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let window = self.windows.next()?;
-        let geometry = if self.layout == Layout::Monocle || self.count <= 1 {
-            self.bounds
-        } else {
-            let main_width = self.bounds.size.w / 2;
-            if self.index == 0 {
-                Geometry::new(self.bounds.loc, (main_width, self.bounds.size.h).into())
-            } else {
-                let count = (self.count - 1) as i32;
-                let index = (self.index - 1) as i32;
-                let height = self.bounds.size.h / count;
-                let remainder = self.bounds.size.h % count;
-                Geometry::new(
-                    (
-                        self.bounds.loc.x + main_width,
-                        self.bounds.loc.y + index * height + index.min(remainder),
+        let geometry = match self.layout {
+            Layout::Monocle | Layout::Tall if self.count <= 1 => self.bounds,
+            Layout::Monocle => self.bounds,
+            Layout::Tall => {
+                let main_width = self.bounds.size.w / 2;
+                if self.index == 0 {
+                    Geometry::new(self.bounds.loc, (main_width, self.bounds.size.h).into())
+                } else {
+                    let count = (self.count - 1) as i32;
+                    let index = (self.index - 1) as i32;
+                    let height = self.bounds.size.h / count;
+                    let remainder = self.bounds.size.h % count;
+                    Geometry::new(
+                        (
+                            self.bounds.loc.x + main_width,
+                            self.bounds.loc.y + index * height + index.min(remainder),
+                        )
+                            .into(),
+                        (
+                            self.bounds.size.w - main_width,
+                            height + i32::from(index < remainder),
+                        )
+                            .into(),
                     )
-                        .into(),
-                    (
-                        self.bounds.size.w - main_width,
-                        height + i32::from(index < remainder),
-                    )
-                        .into(),
-                )
+                }
             }
+            Layout::Spiral => spiral_geometry(self.bounds, self.count, self.index),
         };
         self.index += 1;
         Some(Placement { window, geometry })
@@ -104,6 +115,46 @@ impl<I: ExactSizeIterator<Item = WindowId>> Iterator for Placements<I> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.windows.size_hint()
+    }
+}
+
+/// Compute the geometry of the `index`-th window in a spiral layout.
+///
+/// Alternating left/top splits of the remaining area. The last window receives
+/// the final remainder.
+fn spiral_geometry(bounds: Geometry, count: usize, index: usize) -> Geometry {
+    if count <= 1 || index >= count {
+        return bounds;
+    }
+    let mut area = bounds;
+    let mut horizontal = true; // next split is left/right
+    for _ in 0..index {
+        let half_w = area.size.w / 2;
+        let half_h = area.size.h / 2;
+        if horizontal {
+            area = Geometry::new(
+                (area.loc.x + half_w, area.loc.y).into(),
+                (area.size.w - half_w, area.size.h).into(),
+            );
+        } else {
+            area = Geometry::new(
+                (area.loc.x, area.loc.y + half_h).into(),
+                (area.size.w, area.size.h - half_h).into(),
+            );
+        }
+        horizontal = !horizontal;
+    }
+    // Now place the current window: if last, the remaining area; else the split-off part.
+    if index == count - 1 {
+        area
+    } else {
+        let half_w = area.size.w / 2;
+        let half_h = area.size.h / 2;
+        if horizontal {
+            Geometry::new(area.loc, (half_w, area.size.h).into())
+        } else {
+            Geometry::new(area.loc, (area.size.w, half_h).into())
+        }
     }
 }
 

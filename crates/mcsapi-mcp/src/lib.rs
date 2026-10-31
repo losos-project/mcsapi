@@ -33,6 +33,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutName {
+    /// Successive alternating splits forming a spiral.
+    Spiral,
     /// One main window on the left, the rest stacked on the right.
     Tall,
     /// Every window fills the output; the host shows only the focused one.
@@ -42,6 +44,7 @@ pub enum LayoutName {
 impl From<LayoutName> for Layout {
     fn from(name: LayoutName) -> Self {
         match name {
+            LayoutName::Spiral => Self::Spiral,
             LayoutName::Tall => Self::Tall,
             LayoutName::Monocle => Self::Monocle,
         }
@@ -348,7 +351,7 @@ impl McsapiServer {
 
     /// Lays out windows with a single layout.
     #[tool(
-        description = "Compute logical window geometry for a tall or monocle layout. \
+        description = "Compute logical window geometry for a spiral, tall or monocle layout. \
                        Windows are in tiling order; the first is the main pane."
     )]
     pub async fn arrange(
