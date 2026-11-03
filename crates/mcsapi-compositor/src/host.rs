@@ -18,7 +18,7 @@ use std::{
 mod automation;
 mod capture;
 mod clipboard;
-mod cursor;
+pub(crate) mod cursor;
 mod effects;
 mod foreign;
 mod hints;
@@ -3402,35 +3402,7 @@ impl<S: Shell> Host<S> {
             // To every display (see `kms.rs`).
             #[cfg(feature = "kms")]
             Backend::Kms(k) => {
-                let (mut dmabuf, age) = k.surface.next_buffer()?;
-                let damage = damage(usize::from(age));
-                let mut framebuffer = k.renderer.bind(&mut dmabuf)?;
-                let mut frame = k
-                    .renderer
-                    .render(&mut framebuffer, size, Transform::Normal)?;
-                Frame::render_texture_from_to(
-                    &mut frame,
-                    scene,
-                    src,
-                    screen,
-                    &damage,
-                    &[],
-                    OFFSCREEN_COPY,
-                    1.0,
-                )?;
-                // Held until the vblank, as the scene's client buffers are.
-                if let Some(cursor) = cursor {
-                    let elements = draw_cursor(&mut frame, cursor)?;
-                    k.in_flight.extend(elements);
-                }
-                let sync = frame.finish()?;
-                drop(framebuffer);
-                // The fence goes with the buffer: the flip waits on it in
-                // the kernel (`IN_FENCE_FD`), or Smithay waits on it here
-                // where the plane takes no fence. Nothing relies on the
-                // driver ordering the flip after the drawing by itself.
-                k.surface.queue_buffer(Some(sync), Some(damage), ())?;
-                k.queued(self.timing.pending.take());
+                k.present(scene, OFFSCREEN_COPY, self.timing.pending.take(), cursor)?;
             }
         }
         self.presented.push_front(changed);
@@ -3513,7 +3485,7 @@ fn shell_key_route(shell: &mut impl Shell, key: &KeyInput, consumed_release: boo
 /// Draws one window's surfaces; Smithay lists them topmost first.
 /// Draws the cursor into `frame`, and returns the client buffers it drew,
 /// to be held until the frame is on screen.
-fn draw_cursor(
+pub(crate) fn draw_cursor(
     frame: &mut GlesFrame<'_, '_>,
     cursor: cursor::Drawn,
 ) -> Result<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> {
