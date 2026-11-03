@@ -46,6 +46,7 @@
 
 use std::{collections::VecDeque, io, path::PathBuf};
 
+use crate::host::{cursor::Drawn, draw_cursor};
 use smithay::{
     backend::{
         allocator::{
@@ -354,17 +355,25 @@ impl Kms {
         scene: &GlesTexture,
         transform: Transform,
         feedback: Option<OutputPresentationFeedback>,
+        cursor: Option<Drawn>,
     ) -> Result {
         let mut feedback = feedback;
+        let mut cursor = cursor;
         for (i, display) in self.displays.iter_mut().enumerate() {
             let output = i == 0;
             if !output && display.queued.len() >= QUEUED_FRAMES {
                 continue;
             }
-            match copy(&mut self.renderer, display, scene, transform) {
-                Ok(()) => display.queued.push_back(if output {
+            // The pointer goes over the frame the output shows: the other
+            // displays show the scene scaled, where the cursor's surface
+            // elements, drawn in the scene's coordinates, have no place.
+            let drawn_cursor = output.then(|| cursor.take()).flatten();
+            match copy(&mut self.renderer, display, scene, transform, drawn_cursor) {
+                Ok(cursor_elements) => display.queued.push_back(if output {
+                    let mut elements = std::mem::take(&mut self.in_flight);
+                    elements.extend(cursor_elements);
                     Queued {
-                        elements: std::mem::take(&mut self.in_flight),
+                        elements,
                         feedback: feedback.take(),
                     }
                 } else {
@@ -552,7 +561,8 @@ fn copy(
     display: &mut Display,
     scene: &GlesTexture,
     transform: Transform,
-) -> Result {
+    cursor: Option<Drawn>,
+) -> Result<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> {
     let (w, h) = display.mode.size();
     let size = Size::<i32, Physical>::from((i32::from(w), i32::from(h)));
     let full = Rectangle::from_size(size);
@@ -576,6 +586,13 @@ fn copy(
         transform,
         1.0,
     )?;
+    // The cursor goes over the scene, where the scene fills the display:
+    // its coordinates are the output's. A display of another shape shows
+    // the scene fitted, which a cursor's surfaces cannot follow.
+    let drawn_elements = match cursor {
+        Some(cursor) if dst == full => draw_cursor(&mut frame, cursor)?,
+        _ => Vec::new(),
+    };
     let sync = frame.finish()?;
     drop(framebuffer);
     // The fence goes with the buffer: the flip waits on it in the kernel
@@ -585,7 +602,7 @@ fn copy(
     display
         .surface
         .queue_buffer(Some(sync), Some(vec![full]), ())?;
-    Ok(())
+    Ok(drawn_elements)
 }
 
 /// Where a frame of size `frame` goes on a display of size `screen`: as

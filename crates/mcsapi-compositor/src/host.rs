@@ -4,7 +4,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
-    fs::File,
     hash::{Hash, Hasher},
     io,
     os::{
@@ -19,7 +18,7 @@ use std::{
 mod automation;
 mod capture;
 mod clipboard;
-mod cursor;
+pub(crate) mod cursor;
 mod effects;
 mod foreign;
 mod hints;
@@ -2727,21 +2726,23 @@ impl<S: Shell> Host<S> {
         let in_scene = !self.backend.offscreen()
             || matches!(cursor_drawn, cursor::Drawn::Painted)
             || !self.captures.is_empty()
-            || self.screen_capture.wants(true);
-        let key = (!in_scene && !self.wants_pictures && !self.screen_capture.wants(false))
-            .then(|| {
-                scene_key(
-                    (size, self.lock.locked),
-                    &placements,
-                    &blurs,
-                    [&background, &chrome]
-                        .into_iter()
-                        .chain(&decorations)
-                        .chain(contents.iter().flatten()),
-                    &cursor,
-                )
-            })
-            .flatten();
+            || self.screen_capture.wants(true, |id| self.drawn_alone(id));
+        let key = (!in_scene
+            && !self.wants_pictures
+            && !self.screen_capture.wants(false, |id| self.drawn_alone(id)))
+        .then(|| {
+            scene_key(
+                (size, self.lock.locked),
+                &placements,
+                &blurs,
+                [&background, &chrome]
+                    .into_iter()
+                    .chain(&decorations)
+                    .chain(contents.iter().flatten()),
+                &cursor,
+            )
+        })
+        .flatten();
         // Unless something else changed, the scene is drawn again only
         // where surfaces changed, and copied to the screen only there and
         // where the cursor moved: egui's passes and the placements came out
@@ -2942,7 +2943,6 @@ impl<S: Shell> Host<S> {
         // The scene is bound only once this frame is known to draw: on
         // llvmpipe binding it cost a cursor-only frame some 7 ms, five
         // times what the rest of it took.
-        let renderer = self.backend.renderer();
         if self.screen_capture.dmabuf_unknown() {
             let device = self.backend.client_device();
             let renderable = self
@@ -2961,16 +2961,7 @@ impl<S: Shell> Host<S> {
             .copied()
             .filter(|&id| self.drawn_alone(id))
             .collect();
-        let (renderer, mut framebuffer) = match (&mut self.backend, &mut self.scene) {
-            (backend, Some(scene)) if offscreen => {
-                let renderer = backend.renderer();
-                let framebuffer = renderer.bind(scene)?;
-                (renderer, framebuffer)
-            }
-            (Backend::Winit(backend), _) => backend.bind()?,
-            #[cfg(feature = "kms")]
-            (Backend::Kms(_), _) => unreachable!("the bare seat always draws offscreen"),
-        };
+        let renderer = self.backend.renderer();
         let gl = match &self.gl {
             Some(gl) => gl.clone(),
             None => {
@@ -3411,35 +3402,7 @@ impl<S: Shell> Host<S> {
             // To every display (see `kms.rs`).
             #[cfg(feature = "kms")]
             Backend::Kms(k) => {
-                let (mut dmabuf, age) = k.surface.next_buffer()?;
-                let damage = damage(usize::from(age));
-                let mut framebuffer = k.renderer.bind(&mut dmabuf)?;
-                let mut frame = k
-                    .renderer
-                    .render(&mut framebuffer, size, Transform::Normal)?;
-                Frame::render_texture_from_to(
-                    &mut frame,
-                    scene,
-                    src,
-                    screen,
-                    &damage,
-                    &[],
-                    OFFSCREEN_COPY,
-                    1.0,
-                )?;
-                // Held until the vblank, as the scene's client buffers are.
-                if let Some(cursor) = cursor {
-                    let elements = draw_cursor(&mut frame, cursor)?;
-                    k.in_flight.extend(elements);
-                }
-                let sync = frame.finish()?;
-                drop(framebuffer);
-                // The fence goes with the buffer: the flip waits on it in
-                // the kernel (`IN_FENCE_FD`), or Smithay waits on it here
-                // where the plane takes no fence. Nothing relies on the
-                // driver ordering the flip after the drawing by itself.
-                k.surface.queue_buffer(Some(sync), Some(damage), ())?;
-                k.queued(self.timing.pending.take());
+                k.present(scene, OFFSCREEN_COPY, self.timing.pending.take(), cursor)?;
             }
         }
         self.presented.push_front(changed);
@@ -3522,7 +3485,7 @@ fn shell_key_route(shell: &mut impl Shell, key: &KeyInput, consumed_release: boo
 /// Draws one window's surfaces; Smithay lists them topmost first.
 /// Draws the cursor into `frame`, and returns the client buffers it drew,
 /// to be held until the frame is on screen.
-fn draw_cursor(
+pub(crate) fn draw_cursor(
     frame: &mut GlesFrame<'_, '_>,
     cursor: cursor::Drawn,
 ) -> Result<Vec<WaylandSurfaceRenderElement<GlesRenderer>>> {

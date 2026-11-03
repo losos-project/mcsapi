@@ -66,7 +66,7 @@ pub(super) struct Cursors {
 }
 
 /// What [`Host::draw`] puts at the pointer.
-pub(super) enum Drawn {
+pub(crate) enum Drawn {
     /// Nothing: the client hid it.
     Hidden,
     /// The compositor's own arrow (see `paint_cursor`).
