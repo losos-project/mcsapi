@@ -274,13 +274,25 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { persist-credentials: false }
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
       # Clippy, tests and docs for the default and GPUI builds, rustfmt, the
       # headless example and every package; see `checks` in flake.nix.
-      - run: nix flake check -L
+      - name: nix flake check
+        id: flake-check
+        run: |
+          set -o pipefail
+          nix flake check -L 2>&1 | tee "$RUNNER_TEMP/nix-build.log"
+      - name: file an issue for the failed nix build
+        if: failure() && steps.flake-check.outcome == 'failure'
+        uses: ./.github/actions/nix-build-failure
+        with:
+          target: checks (nix flake check)
       - name: Dev shell
         run: nix develop -i -k TERM -k HOME -c cargo --version
 

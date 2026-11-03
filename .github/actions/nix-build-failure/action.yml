@@ -1,0 +1,51 @@
+name: Nix build failure
+description: "Open a GitHub issue from a failed `nix build` step. Call it right after the failed step with `if: failure() && steps.<id>.outcome == 'failure'`."
+
+inputs:
+  log-file:
+    description: Path to the `nix build` output captured by the failed step. Defaults to $RUNNER_TEMP/nix-build.log.
+    required: false
+    default: ""
+  target:
+    description: Flake output that failed, e.g. .#checks.x86_64-linux.t3.
+    required: false
+    default: ""
+  issue-title:
+    description: Issue title, with optional {ref}, {sha} and {target} placeholders.
+    required: false
+    default: "[nix] Build failed on {ref}: {target}"
+  token:
+    description: GitHub token used to create the issue.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TARGET: ${{ inputs.target }}
+        ISSUE_TITLE: ${{ inputs.issue-title }}
+        LOG_FILE: ${{ inputs.log-file }}
+        REF: ${{ github.head_ref || github.ref_name }}
+        SHA: ${{ github.sha }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        log="${LOG_FILE:-${RUNNER_TEMP}/nix-build.log}"
+
+        title="${ISSUE_TITLE//\{ref\}/${REF}}"
+        title="${title//\{sha\}/${SHA}}"
+        title="${title//\{target\}/${TARGET}}"
+
+        body_file="${RUNNER_TEMP}/nix-build-issue.md"
+        {
+          printf 'Failed Nix build: `%s`\n\n' "${TARGET:-nix build}"
+          printf '[Failed workflow run](%s)\n\n' "$RUN_URL"
+          printf '```text\n'
+          cat "$log" 2>/dev/null \
+            || printf 'No build log was captured. See the workflow run for output.\n'
+          printf '```\n'
+        } > "$body_file"
+
+        gh issue create --title "$title" --body-file "$body_file" --repo "$GITHUB_REPOSITORY"
