@@ -4,7 +4,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
-    fs::File,
     hash::{Hash, Hasher},
     io,
     os::{
@@ -2727,21 +2726,23 @@ impl<S: Shell> Host<S> {
         let in_scene = !self.backend.offscreen()
             || matches!(cursor_drawn, cursor::Drawn::Painted)
             || !self.captures.is_empty()
-            || self.screen_capture.wants(true);
-        let key = (!in_scene && !self.wants_pictures && !self.screen_capture.wants(false))
-            .then(|| {
-                scene_key(
-                    (size, self.lock.locked),
-                    &placements,
-                    &blurs,
-                    [&background, &chrome]
-                        .into_iter()
-                        .chain(&decorations)
-                        .chain(contents.iter().flatten()),
-                    &cursor,
-                )
-            })
-            .flatten();
+            || self.screen_capture.wants(true, |id| self.drawn_alone(id));
+        let key = (!in_scene
+            && !self.wants_pictures
+            && !self.screen_capture.wants(false, |id| self.drawn_alone(id)))
+        .then(|| {
+            scene_key(
+                (size, self.lock.locked),
+                &placements,
+                &blurs,
+                [&background, &chrome]
+                    .into_iter()
+                    .chain(&decorations)
+                    .chain(contents.iter().flatten()),
+                &cursor,
+            )
+        })
+        .flatten();
         // Unless something else changed, the scene is drawn again only
         // where surfaces changed, and copied to the screen only there and
         // where the cursor moved: egui's passes and the placements came out
@@ -2942,7 +2943,6 @@ impl<S: Shell> Host<S> {
         // The scene is bound only once this frame is known to draw: on
         // llvmpipe binding it cost a cursor-only frame some 7 ms, five
         // times what the rest of it took.
-        let renderer = self.backend.renderer();
         if self.screen_capture.dmabuf_unknown() {
             let device = self.backend.client_device();
             let renderable = self
@@ -2961,16 +2961,7 @@ impl<S: Shell> Host<S> {
             .copied()
             .filter(|&id| self.drawn_alone(id))
             .collect();
-        let (renderer, mut framebuffer) = match (&mut self.backend, &mut self.scene) {
-            (backend, Some(scene)) if offscreen => {
-                let renderer = backend.renderer();
-                let framebuffer = renderer.bind(scene)?;
-                (renderer, framebuffer)
-            }
-            (Backend::Winit(backend), _) => backend.bind()?,
-            #[cfg(feature = "kms")]
-            (Backend::Kms(_), _) => unreachable!("the bare seat always draws offscreen"),
-        };
+        let renderer = self.backend.renderer();
         let gl = match &self.gl {
             Some(gl) => gl.clone(),
             None => {
