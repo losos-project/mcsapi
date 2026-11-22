@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Node.js/TypeScript bindings for mcsapi"
 license = "GPL-3.0-only"
-repository = "https://github.com/dasmatus/mcsapi"
+repository = "https://github.com/losos-project/mcsapi"
 publish = false
 
 # Standalone so the Node addon does not become part of the root crate's build.

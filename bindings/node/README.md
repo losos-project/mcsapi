@@ -32,6 +32,7 @@ desktop.insert(10)
 desktop.insert(11)
 desktop.focusPrevious()
 desktop.promoteFocused()
+// A new workspace uses 'spiral'. setLayout selects 'spiral', 'tall', or 'monocle'.
 desktop.setLayout('tall')
 
 for (const { window, geometry } of desktop.arrange({ x: 0, y: 0, width: 1920, height: 1080 })) {
@@ -39,6 +40,7 @@ for (const { window, geometry } of desktop.arrange({ x: 0, y: 0, width: 1920, he
 }
 
 // Layouts work without a Desktop, for previews or custom membership tracking.
+arrange('spiral', { x: 0, y: 0, width: 800, height: 600 }, [1, 2, 3])
 arrange('monocle', { x: 0, y: 0, width: 800, height: 600 }, [1, 2])
 ```
 
@@ -46,7 +48,14 @@ arrange('monocle', { x: 0, y: 0, width: 800, height: 600 }, [1, 2])
 `moveWindow`, `switchTo`, `focus`, `focusNext`, `focusPrevious`,
 `promoteFocused`, `setLayout`, and `arrange`. `active()` and `workspaces()`
 return plain snapshot objects; `workspaceOf(window)` finds a window's
-workspace.
+workspace. The layout names are `'spiral'` (the default on a new workspace),
+`'tall'`, and `'monocle'`. Spiral splits the remaining area alternately left
+and top, with the last window filling whatever is left; tall puts one main
+window in the left half (half the width, rounding down) and stacks the others
+on the right; monocle gives every window the same bounds, and the host
+displays only the focused one. A single window fills the output in every
+layout. For tall with more than one window, a width under 2 or a stack taller
+than the output throws `InsufficientSpace`.
 
 IDs are JavaScript numbers and must be integers from 1 to
 `Number.MAX_SAFE_INTEGER`. Errors are thrown as `Error` objects whose `code`

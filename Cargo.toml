@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "GPL-3.0-only"
-repository = "https://github.com/dasmatus/mcsapi"
+repository = "https://github.com/losos-project/mcsapi"
 
 [workspace.dependencies]
 mcsapi = { path = "crates/mcsapi", version = "0.1.0" }

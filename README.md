@@ -15,6 +15,7 @@ member:
 | `mcsapi-theme` | `crates/mcsapi-theme` | Theming engine: theme files, derived component tokens, and exports for the freedesktop appearance settings, GTK settings, cursors, Android resources and JSON. No dependencies, so any process can read the theme. |
 | `mcsapi-ui` | `crates/mcsapi-ui` | UI toolkit for apps: an `App` trait drawn with egui and the shared shell `Theme`, 1:1 touchpad gestures (`gesture`), and the `Result` apps report failures with (`error`): a miette report that names the documentation section explaining it, which `ErrorDialog` (an alert dialog) or the inline `ErrorAlert` in `mcsapi-components` and `mcsapi-components-gpui` draws with a "Learn more" button, offline copy first. |
 | `mcsapi-runtime` | `crates/mcsapi-runtime` | Separate runtime for running apps: app registration and instance lifecycle. Starter. |
+| `mcsapi-components` | `crates/mcsapi-components` | Component library for mcsapi apps, drawn as native egui widgets and styled by the shell `Theme` through `Tokens`: buttons, forms, navigation, overlays, typography, and mcsapi's own error alert and dialogs. |
 | `mcsapi-components-gpui` | `crates/mcsapi-components-gpui` | The `mcsapi-components` library as native GPUI elements, behind its `gpui` feature. Buttons, toggles, badges, checkboxes, switches, alerts, separators, labels, progress bars and tooltips are drawn by Zed's `ui` components; `Assets` serves the icons they draw. |
 | `mcsapi-zed-ui` and friends | `crates/mcsapi-zed-*` | Zed's GPUI component stack, copied from [Sonne](https://github.com/dasmatus/sonne) under GPL-3.0-or-later with Zed's library names: `ui`, `component`, `menu`, `ui_macros`, `icons` (with the SVGs embedded) and `theme`. The theme crate has no registry or JSON themes; `theme::theme_from_mcsapi` builds Zed's `ThemeColors` from an mcsapi theme's tokens. Behind each crate's `gpui` feature. |
 | `mcsapi-gallery` | `crates/mcsapi-gallery` | Widget gallery in a GPUI window (`--features gpui`): every shell widget and component with its variants and states, under switchable themes. |
@@ -35,7 +36,7 @@ toolkit and a compositor can use `mcsapi` without either starter crate.
 - Distinct nonzero `WindowId` and `WorkspaceId` types.
 - Fixed workspaces, unique window membership, focus cycling, promotion to the
   main pane, and moving windows between workspaces.
-- Tall and monocle layouts using Smithay's logical-coordinate rectangles.
+- Spiral (the default), tall, and monocle layouts using Smithay's logical-coordinate rectangles.
 - Iterator-first APIs: ordered trees own state; window/workspace enumeration
   and lazy placement generation need no temporary collections. No `Vec`
   storage is used by mcsapi; upstream toolkits may use their own collections.
@@ -56,8 +57,8 @@ fn main() -> Result<(), mcsapi::Error> {
         Desktop::new((1..=9).map(|id| WorkspaceId::new(id).unwrap()))?;
     desktop.insert(WindowId::new(1).unwrap())?;
     desktop.insert(WindowId::new(2).unwrap())?;
-    desktop.active_mut().focus_previous();
-    desktop.active_mut().promote_focused();
+    desktop.focus_previous();
+    desktop.promote_focused();
 
     let bounds = Geometry::new((0, 0).into(), (1920, 1080).into());
     for placement in desktop.active().arrange(bounds)? {
@@ -74,11 +75,17 @@ focuses the new window. Focus wraps in this same order. Removing a focused windo
 focuses its next neighbor, wrapping when needed. IDs are assigned by the host:
 do not reuse an ID while stale commands for it can still arrive.
 
-`arrange` validates bounds before returning an exact-size iterator. Tall puts
-one window in the left half and stacks the others on the right, distributing
-remainder pixels from the top. Tiny outputs return `InsufficientSpace`, rather
-than emitting zero-sized tiles. Monocle configures all windows to the same
-bounds; the host displays only the focused one.
+`arrange` uses the workspace's layout, which defaults to spiral, and validates
+bounds before returning an exact-size iterator. Spiral splits the remaining
+area alternately left and top: the first window takes the left half, the next
+the top half of the remainder, and so on, with the last window filling
+whatever is left. Tall puts one window in the left half (half the width,
+rounding down) and stacks the others on the right, distributing remainder
+pixels from the top. A single window fills the output in every layout. For
+tall with more than one window, a width under 2 or a stack taller than the
+output returns `InsufficientSpace`, rather than emitting zero-sized tiles.
+Monocle configures all windows to the same bounds; the host displays only the
+focused one.
 
 ## Smithay integration boundary
 
@@ -242,8 +249,9 @@ Each call carries everything it needs.
   `switch_to`, `move_window`, `set_layout`), and optional output bounds. It
   replays them on a fresh `Desktop` and returns each workspace's windows in
   tiling order, focus, layout, the active workspace, and the placements. A
-  failing operation is reported by index with the library's error text.
-- `arrange` lays out windows already in tiling order with `tall` or `monocle`.
+  new desktop uses `spiral` until `set_layout` changes it. A failing
+  operation is reported by index with the library's error text.
+- `arrange` lays out windows already in tiling order with `spiral`, `tall`, or `monocle`.
 
 `.mcp.json` (Claude Code) and `.vscode/mcp.json` (VS Code and Copilot) point at
 the default address, so start the server and the tools appear in either.
